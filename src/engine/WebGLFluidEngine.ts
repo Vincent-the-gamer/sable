@@ -1066,8 +1066,9 @@ export class WebGLFluidEngine {
   }
 
   private generateColor(): [number, number, number] {
-    const [minHue, maxHue] = this.config.hueRange
-    const h = (minHue + Math.random() * (maxHue - minHue)) / 360
+    // 在 baseHue ±25° 范围内随机生成
+    const baseHue = this.config.hue
+    const h = ((baseHue + (Math.random() - 0.5) * 50) / 360 + 1) % 1
     const c = this.hsvToRgb(h, 1.0, 1.0)
     return [c[0] * 0.15, c[1] * 0.15, c[2] * 0.15]
   }
@@ -1195,22 +1196,41 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 节拍爆发
-    if (beat.isBeat && beat.intensity > 0.25) {
-      const burstCount = 5 + Math.floor(beat.intensity * 10)
+    // 节拍爆发 — 更鲜明
+    if (beat.isBeat && beat.intensity > 0.2) {
+      const burstCount = 8 + Math.floor(beat.intensity * 15)
       for (let i = 0; i < burstCount; i++) {
         const color = this.generateColor()
-        const brightness = 0.25 + beat.intensity * 1.5
+        const brightness = 0.3 + beat.intensity * 2.5
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.6
+        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.0
         this.pendingSplats.push({
-          x: 0.2 + Math.random() * 0.6,   // 偏中心区域
-          y: 0.2 + Math.random() * 0.6,
+          x: 0.15 + Math.random() * 0.7,
+          y: 0.15 + Math.random() * 0.7,
           dx: Math.cos(angle) * speed,
           dy: Math.sin(angle) * speed,
+          color,
+        })
+      }
+
+      // 额外：中心辐射状爆发
+      const radialCount = Math.floor(beat.intensity * 8)
+      for (let i = 0; i < radialCount; i++) {
+        const color = this.generateColor()
+        color[0] *= beat.intensity * 2
+        color[1] *= beat.intensity * 2
+        color[2] *= beat.intensity * 2
+        const a = (i / radialCount) * Math.PI * 2
+        const r = 0.05 + Math.random() * 0.15
+        const spd = this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.8
+        this.pendingSplats.push({
+          x: 0.5 + Math.cos(a) * r,
+          y: 0.5 + Math.sin(a) * r,
+          dx: Math.cos(a) * spd,
+          dy: Math.sin(a) * spd,
           color,
         })
       }

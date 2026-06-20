@@ -230,12 +230,8 @@ export class ParticleEngine {
   }
 
   private spawnParticle(emitter: Emitter, energy: number, _beat: BeatResult) {
-    const [minHue, maxHue] = this.config.hueRange
-    const hueRange = maxHue - minHue
-
-    // 频段决定色调
-    const bandT = emitter.frequencyBand === -1 ? 0.5 : emitter.frequencyBand / 7
-    const hue = minHue + bandT * hueRange
+    const baseHue = this.config.hue
+    const hue = baseHue + (Math.random() - 0.5) * 50
 
     // 速度方向：从发射点向外扩散
     const angle = emitter.angle + (Math.random() - 0.5) * Math.PI * 0.8
@@ -260,8 +256,7 @@ export class ParticleEngine {
   }
 
   private spawnBurstParticle(beat: BeatResult) {
-    const [minHue, maxHue] = this.config.hueRange
-    const hue = minHue + Math.random() * (maxHue - minHue)
+    const hue = this.config.hue + (Math.random() - 0.5) * 50
     const angle = Math.random() * Math.PI * 2
     const dist = 0.05 + Math.random() * 0.25
     const speed = 5 + beat.intensity * 25
@@ -294,7 +289,7 @@ export class ParticleEngine {
     ctx.fillRect(0, 0, w, h)
 
     const energy = spectrum?.averageEnergy ?? 0.1
-    const [minHue, maxHue] = this.config.hueRange
+    const hue = this.config.hue
 
     // ═══ 背景辉光 ═══
     const glowRadius = (120 + energy * 200 + this.beatEnergy * 150) * this.config.glowIntensity
@@ -302,8 +297,8 @@ export class ParticleEngine {
     const cy = h * 0.45
 
     const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowRadius)
-    glowGrad.addColorStop(0, `hsla(${minHue}, 80%, 50%, ${0.15 + energy * 0.25})`)
-    glowGrad.addColorStop(0.4, `hsla(${(minHue + maxHue) / 2}, 70%, 40%, ${energy * 0.15})`)
+    glowGrad.addColorStop(0, `hsla(${hue}, 80%, 50%, ${0.15 + energy * 0.25})`)
+    glowGrad.addColorStop(0.4, `hsla(${hue + 20}, 70%, 40%, ${energy * 0.15})`)
     glowGrad.addColorStop(1, 'transparent')
     ctx.fillStyle = glowGrad
     ctx.fillRect(cx - glowRadius, cy - glowRadius, glowRadius * 2, glowRadius * 2)
@@ -313,7 +308,7 @@ export class ParticleEngine {
       const ex = emitter.x * w
       const ey = emitter.y * h
       const eGlow = ctx.createRadialGradient(ex, ey, 0, ex, ey, 25 + energy * 30)
-      eGlow.addColorStop(0, `hsla(${minHue}, 60%, 60%, ${0.1 + energy * 0.15})`)
+      eGlow.addColorStop(0, `hsla(${hue}, 60%, 60%, ${0.1 + energy * 0.15})`)
       eGlow.addColorStop(1, 'transparent')
       ctx.fillStyle = eGlow
       ctx.fillRect(ex - 30, ey - 30, 60, 60)

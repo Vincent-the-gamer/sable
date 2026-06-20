@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
-import { save } from "@tauri-apps/plugin-dialog";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { ref, computed, onMounted, onUnmounted } from "vue";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import AudioLoader from "./components/AudioLoader.vue";
 import EffectStudio from "./components/EffectStudio.vue";
 import SettingsPage from "./components/SettingsPage.vue";
@@ -10,12 +10,16 @@ import { AudioEngine } from "./engine/AudioEngine";
 import { BeatDetector } from "./engine/BeatDetector";
 import { WebGLFluidEngine } from "./engine/WebGLFluidEngine";
 import { ExportPipeline } from "./engine/ExportPipeline";
+import { LrcParser } from "./engine/LrcParser";
 import type {
     SpectrumData,
     BeatResult,
     VisualizerConfig,
     ExportSettings,
+    LyricLine,
+    SubtitleConfig,
 } from "./types";
+import { DEFAULT_SUBTITLE_CONFIG } from "./types";
 import type { ExportProgress as ExportProgressData } from "./engine/ExportPipeline";
 
 // ═══════════ Pages ═══════════
@@ -41,7 +45,7 @@ const visualizerConfig = ref<VisualizerConfig>({
     particleCount: 250,
     glowIntensity: 1.0,
     shakeIntensity: 1.0,
-    hueRange: [220, 300],
+    hue: 260,
 });
 
 const exportSettings = ref<ExportSettings>({
@@ -60,6 +64,33 @@ const exportDone = ref(false);
 const previewVideoUrl = ref("");
 const ffmpegPath = ref(localStorage.getItem("sable_ffmpeg_path") || "");
 
+// ═══════════ Lyrics ═══════════
+const lyrics = ref<LyricLine[]>([]);
+const currentLyric = ref("");
+const hasLyrics = computed(() => lyrics.value.length > 0);
+
+const subtitleConfig = ref<SubtitleConfig>({ ...DEFAULT_SUBTITLE_CONFIG });
+
+async function onLrcLoaded(lrcContent: string) {
+    lyrics.value = LrcParser.parse(lrcContent);
+    console.log(`[App] 歌词加载完成: ${lyrics.value.length} 行`);
+}
+
+async function openLrcFile() {
+    try {
+        const selected = await open({
+            filters: [{ name: "LRC Lyrics", extensions: ["lrc"] }],
+        });
+        const path = selected as string | null;
+        if (path) {
+            const content = await invoke<string>("read_file_text", { path });
+            onLrcLoaded(content);
+        }
+    } catch (err) {
+        console.error("加载 LRC 失败:", err);
+    }
+}
+
 function syncFfmpegPath() {
     ffmpegPath.value = localStorage.getItem("sable_ffmpeg_path") || "";
 }
@@ -77,6 +108,18 @@ function startTimeTracker() {
             latestSpectrum.value = audioEngine.getSpectrumData();
             if (latestSpectrum.value)
                 latestBeat.value = beatDetector.detect(latestSpectrum.value);
+            // 同步歌词
+            if (lyrics.value.length > 0) {
+                const t = audioEngine.currentTime;
+                let found: string | undefined;
+                for (let i = lyrics.value.length - 1; i >= 0; i--) {
+                    if (lyrics.value[i].startTime <= t) {
+                        found = lyrics.value[i].text;
+                        break;
+                    }
+                }
+                currentLyric.value = found ?? "";
+            }
         } else {
             // Audio ended naturally (onended)
             isPlaying.value = false;
@@ -175,6 +218,15 @@ function startExport() {
         percent: 0,
         stage: "decoding",
     };
+
+    // 生成 SRT 字幕文件（与视频同名 .srt）
+    if (lyrics.value.length > 0) {
+        const srtPath = exportVideoPath.value.replace(/\.[^.]+$/, ".srt");
+        const srtContent = LrcParser.toSrt(lyrics.value, duration.value);
+        invoke("write_file_text", { path: srtPath, content: srtContent })
+            .then(() => console.log("[App] SRT 字幕已生成:", srtPath))
+            .catch((e) => console.warn("[App] SRT 生成失败:", e));
+    }
 
     const { cancel, done } = ExportPipeline.startExport(
         loadedFilePath.value,
@@ -358,8 +410,15 @@ onUnmounted(() => {
                 :export-done="exportDone"
                 :export-video-path="exportVideoPath"
                 :preview-video-url="previewVideoUrl"
+                :lyrics="lyrics"
+                :current-lyric="currentLyric"
+                :has-lyrics="hasLyrics"
+                :subtitle-config="subtitleConfig"
+                :latest-beat="latestBeat"
                 @update:config="onUpdateConfig"
                 @update:export-settings="onUpdateExportSettings"
+                @update:subtitle-config="(c) => (subtitleConfig = c)"
+                @lrc-import="openLrcFile"
                 @play="play"
                 @pause="pause"
                 @seek="seek"
@@ -536,5 +595,38 @@ body,
 .hint-text {
     font-size: 13px;
     color: rgba(255, 255, 255, 0.2);
+}
+
+.lyric-overlay {
+    position: absolute;
+    bottom: 18%;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 15;
+    text-align: center;
+    pointer-events: none;
+}
+
+.lyric-text {
+    font-size: clamp(14px, 3vw, 28px);
+    font-weight: 700;
+    color: #fff;
+    text-shadow:
+        0 0 20px rgba(168, 85, 247, 0.8),
+        0 0 40px rgba(168, 85, 247, 0.4),
+        0 2px 4px rgba(0, 0, 0, 0.6);
+    animation: lyricFadeIn 0.3s ease-out;
+    letter-spacing: 0.05em;
+}
+
+@keyframes lyricFadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 </style>

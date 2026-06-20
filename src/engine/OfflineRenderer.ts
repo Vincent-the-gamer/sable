@@ -167,7 +167,7 @@ export class OfflineRenderer {
     const cy = this.height * 0.7
     const angle = Math.random() * Math.PI * 2
     const speed = 0.5 + energy * 4 + Math.random() * 2
-    const [minHue, maxHue] = this.config.hueRange
+    const hue = this.config.hue + (Math.random() - 0.5) * 50
 
     return {
       x: cx + (Math.random() - 0.5) * 60,
@@ -177,7 +177,7 @@ export class OfflineRenderer {
       life: 1,
       maxLife: 0.6 + Math.random() * 0.8,
       size: 1 + energy * 4 + Math.random() * 3,
-      hue: minHue + Math.random() * (maxHue - minHue),
+      hue,
       alpha: 0.6 + Math.random() * 0.4,
     }
   }
@@ -236,8 +236,8 @@ export class OfflineRenderer {
     const glowRadius = (80 + energy * 160) * this.config.glowIntensity * beatBoost
 
     const outerGradient = ctx.createRadialGradient(cx, cy, glowRadius * 0.3, cx, cy, glowRadius)
-    outerGradient.addColorStop(0, `hsla(${this.config.hueRange[0]}, 100%, 60%, ${0.4 * energy * beatBoost})`)
-    outerGradient.addColorStop(0.5, `hsla(${this.config.hueRange[0] + 40}, 100%, 50%, ${0.15 * energy * beatBoost})`)
+    outerGradient.addColorStop(0, `hsla(${this.config.hue}, 100%, 60%, ${0.4 * energy * beatBoost})`)
+    outerGradient.addColorStop(0.5, `hsla(${this.config.hue + 40}, 100%, 50%, ${0.15 * energy * beatBoost})`)
     outerGradient.addColorStop(1, 'transparent')
     ctx.fillStyle = outerGradient
     ctx.fillRect(cx - glowRadius, cy - glowRadius, glowRadius * 2, glowRadius * 2)

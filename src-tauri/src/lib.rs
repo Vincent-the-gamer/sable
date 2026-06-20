@@ -21,6 +21,35 @@ fn read_file_bytes(path: String) -> Result<String, String> {
     Ok(base64_encode(&bytes))
 }
 
+/// 读取文本文件（UTF-8）
+#[tauri::command]
+fn read_file_text(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))
+}
+
+/// 写入文本文件（UTF-8）
+#[tauri::command]
+fn write_file_text(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("写入文件失败: {e}"))
+}
+
+/// 枚举系统字体
+#[tauri::command]
+fn list_system_fonts() -> Vec<String> {
+    let db = fontdb::Database::new();
+    let mut names: Vec<String> = db
+        .faces()
+        .filter_map(|info| {
+            let families = &info.families;
+            families.first().map(|(name, _)| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(200);
+    names
+}
+
 /// 解码音频文件（旧接口，保留兼容）
 #[tauri::command]
 fn decode_audio(path: String) -> Result<AudioDecodeResult, String> {
@@ -130,6 +159,9 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             read_file_bytes,
+            read_file_text,
+            write_file_text,
+            list_system_fonts,
             decode_audio,
             start_video_export,
             send_video_frame,
