@@ -15,19 +15,15 @@ const props = defineProps<{
 }>();
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-let resizeObserver: ResizeObserver | null = null;
 
 onMounted(() => {
-    if (canvasRef.value) {
-        resizeObserver = new ResizeObserver(() => {
-            props.engine?.resize();
-        });
-        resizeObserver.observe(canvasRef.value);
+    if (canvasRef.value && props.engine) {
+        props.engine.resize();
     }
 });
 
 onUnmounted(() => {
-    resizeObserver?.disconnect();
+    props.engine?.stop();
 });
 
 watch(
@@ -40,26 +36,24 @@ watch(
     { deep: true },
 );
 
-// Expose canvas so parent can directly initialize visualizer
-defineExpose({ canvas: canvasRef });
+// Expose canvas element directly (not the Ref)
+defineExpose({
+    get canvas() {
+        return canvasRef.value;
+    },
+});
 </script>
 
 <template>
-    <div class="visualizer-container">
-        <canvas ref="canvasRef" class="visualizer-canvas" />
-    </div>
+    <canvas ref="canvasRef" class="visualizer-canvas" />
 </template>
 
 <style scoped>
-.visualizer-container {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
-}
-
 .visualizer-canvas {
     display: block;
     width: 100%;
     height: 100%;
+    position: absolute;
+    inset: 0;
 }
 </style>

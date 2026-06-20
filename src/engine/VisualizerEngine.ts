@@ -167,9 +167,6 @@ export class VisualizerEngine {
     if (spectrum) {
       // 绘制辉光
       this.renderGlow(spectrum, beat)
-
-      // 绘制频谱波形
-      this.renderWaveform(spectrum)
     }
 
     // 绘制粒子
@@ -206,34 +203,6 @@ export class VisualizerEngine {
       ctx.fillStyle = coreGradient
       ctx.fillRect(cx - glowRadius * 0.4, cy - glowRadius * 0.4, glowRadius * 0.8, glowRadius * 0.8)
     }
-  }
-
-  /** 底部频谱波形 */
-  private renderWaveform(spectrum: SpectrumData): void {
-    const ctx = this.ctx
-    const w = this.width
-    const h = this.height
-    const data = spectrum.waveform
-    const step = w / data.length
-
-    ctx.beginPath()
-    ctx.moveTo(0, h)
-
-    for (let i = 0; i < data.length; i++) {
-      const x = i * step
-      // 波形值映射到 y 坐标 (128 是中心线)
-      const y = h - (data[i] / 255) * h * 0.3
-      ctx.lineTo(x, y)
-    }
-
-    ctx.lineTo(w, h)
-    ctx.closePath()
-
-    const gradient = ctx.createLinearGradient(0, h, 0, h * 0.5)
-    gradient.addColorStop(0, `hsla(${this.config.hueRange[0]}, 80%, 50%, 0.3)`)
-    gradient.addColorStop(1, `hsla(${this.config.hueRange[1]}, 80%, 50%, 0.05)`)
-    ctx.fillStyle = gradient
-    ctx.fill()
   }
 
   /** 粒子渲染 */

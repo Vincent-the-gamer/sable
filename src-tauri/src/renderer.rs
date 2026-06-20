@@ -32,9 +32,8 @@ struct Particle {
 struct Spectrum {
     #[allow(dead_code)]
     freq: Vec<u8>, // 0..255
-    waveform: Vec<u8>, // 0..255
-    avg_energy: f32,   // 0..1
-    bass_energy: f32,  // 0..1
+    avg_energy: f32,  // 0..1
+    bass_energy: f32, // 0..1
 }
 
 struct BeatResult {
@@ -143,7 +142,6 @@ impl FrameRenderer {
         if self.samples.is_empty() {
             return Spectrum {
                 freq: vec![0; 128],
-                waveform: vec![0; 128],
                 avg_energy: 0.0,
                 bass_energy: 0.0,
             };
@@ -174,18 +172,6 @@ impl FrameRenderer {
             freq[i] = (mag * 255.0) as u8;
         }
 
-        // 时域波形 → 0..255
-        let mut waveform = vec![0u8; 128];
-        let wav_step = (self.fft_size as f32 / 128.0).max(1.0);
-        for i in 0..128 {
-            let s_idx = (window_start as f32 + i as f32 * wav_step) as usize;
-            if s_idx < self.samples.len() {
-                let v = (self.samples[s_idx] + 1.0) / 2.0;
-                waveform[i] = (v * 255.0).min(255.0) as u8;
-            }
-        }
-
-        // 能量
         let avg_energy = freq.iter().map(|&v| v as f32).sum::<f32>() / (half * 255) as f32;
 
         let bass_bins = half / 4;
@@ -194,7 +180,6 @@ impl FrameRenderer {
 
         Spectrum {
             freq,
-            waveform,
             avg_energy,
             bass_energy,
         }
@@ -239,9 +224,6 @@ impl FrameRenderer {
     // ══════════════════ 粒子系统 ══════════════════
 
     fn update_particles(&mut self, spectrum: &Spectrum, beat: &BeatResult) {
-        let cx = self.width as f32 / 2.0;
-        let cy = self.height as f32 * 0.7;
-
         let spawn_rate = 3.0 + spectrum.avg_energy * 12.0;
         let to_spawn = if beat.is_beat {
             (spawn_rate * 3.0) as u32
@@ -252,7 +234,7 @@ impl FrameRenderer {
         for _ in 0..to_spawn {
             if self.particles.len() < self.config.particle_count as usize {
                 self.particles
-                    .push(self.spawn_particle(cx, cy, spectrum.avg_energy));
+                    .push(self.spawn_particle(spectrum.avg_energy));
             }
         }
 
@@ -275,14 +257,17 @@ impl FrameRenderer {
         }
     }
 
-    fn spawn_particle(&self, cx: f32, cy: f32, energy: f32) -> Particle {
+    fn spawn_particle(&self, energy: f32) -> Particle {
         let angle = rand::thread_rng().gen_range(0.0..PI * 2.0);
         let speed = 0.5 + energy * 4.0 + rand::thread_rng().gen_range(0.0..2.0);
         let (min_hue, max_hue) = self.config.hue_range;
+        // 全屏随机位置
+        let x = rand::thread_rng().gen_range(0.0..self.width as f32);
+        let y = rand::thread_rng().gen_range(0.0..self.height as f32);
 
         Particle {
-            x: cx + (rand::thread_rng().gen_range(-0.5..0.5)) * 60.0,
-            y: cy + (rand::thread_rng().gen_range(-0.5..0.5)) * 40.0,
+            x,
+            y,
             vx: angle.cos() * speed,
             vy: angle.sin() * speed - 1.0,
             life: 1.0,
@@ -320,114 +305,65 @@ impl FrameRenderer {
         // 辉光
         self.draw_glow(spectrum, beat, shake_dx, shake_dy);
 
-        // 波形
-        self.draw_waveform(spectrum, shake_dx, shake_dy);
-
         // 粒子
         self.draw_particles(shake_dx, shake_dy);
     }
 
     fn draw_glow(&mut self, spectrum: &Spectrum, beat: &BeatResult, dx: f32, dy: f32) {
-        let cx = self.width as f32 / 2.0 + dx;
-        let cy = self.height as f32 * 0.7 + dy;
         let energy = spectrum.avg_energy;
         let beat_boost = if beat.is_beat {
             1.0 + beat.intensity * 0.5
         } else {
             1.0
         };
-        let glow_radius = (80.0 + energy * 160.0) * self.config.glow_intensity * beat_boost;
+        let glow_radius = (60.0 + energy * 120.0) * self.config.glow_intensity * beat_boost;
 
         if glow_radius <= 0.0 {
             return;
         }
 
         let (min_hue, _max_hue) = self.config.hue_range;
-
-        // 外层辉光
-        let alpha1 = (0.4 * energy * beat_boost * 255.0) as u8;
-        let color1 = hsl_to_rgba(min_hue, 1.0, 0.6, alpha1);
-
-        let alpha2 = (0.15 * energy * beat_boost * 255.0) as u8;
         let mid_hue = (min_hue + 40.0) % 360.0;
-        let color2 = hsl_to_rgba(mid_hue, 1.0, 0.5, alpha2);
 
-        // 使用多个径向渐变层模拟 3-stop 渐变
-        // 层 1: 内到中
-        draw_radial_gradient_circle(
-            &mut self.pixmap,
-            cx,
-            cy,
-            0.0,
-            glow_radius * 0.5,
-            color1,
-            Color::from_rgba8(0, 0, 0, 0),
-        );
+        // 全屏多个随机辉光点，随能量增多
+        let num_glows = 3 + (energy * 5.0) as usize;
+        for i in 0..num_glows {
+            let cx = rand::thread_rng().gen_range(0.0..self.width as f32) + dx;
+            let cy = rand::thread_rng().gen_range(0.0..self.height as f32) + dy;
+            let r = glow_radius * (0.5 + 0.5 * (i as f32 / num_glows as f32));
 
-        // 层 2: 中到外
-        draw_radial_gradient_circle(
-            &mut self.pixmap,
-            cx,
-            cy,
-            glow_radius * 0.3,
-            glow_radius,
-            color2,
-            Color::from_rgba8(0, 0, 0, 0),
-        );
+            let alpha1 = (0.3 * energy * beat_boost * 255.0) as u8;
+            let color1 = hsl_to_rgba(min_hue, 1.0, 0.6, alpha1);
 
-        // 核心亮点
-        if beat.is_beat || energy > 0.3 {
-            let core_alpha = (0.3 + beat.intensity * 0.5).min(1.0);
-            let core_color = Color::from_rgba8(255, 255, 255, (core_alpha * 255.0) as u8);
             draw_radial_gradient_circle(
                 &mut self.pixmap,
                 cx,
                 cy,
                 0.0,
-                glow_radius * 0.4,
-                core_color,
+                r * 0.5,
+                color1,
+                Color::from_rgba8(0, 0, 0, 0),
+            );
+
+            let alpha2 = (0.1 * energy * beat_boost * 255.0) as u8;
+            let color2 = hsl_to_rgba(mid_hue, 1.0, 0.5, alpha2);
+            draw_radial_gradient_circle(
+                &mut self.pixmap,
+                cx,
+                cy,
+                r * 0.3,
+                r,
+                color2,
                 Color::from_rgba8(0, 0, 0, 0),
             );
         }
-    }
 
-    fn draw_waveform(&mut self, spectrum: &Spectrum, dx: f32, dy: f32) {
-        let w = self.width as f32;
-        let h = self.height as f32;
-        let step = w / spectrum.waveform.len() as f32;
-
-        let mut pb = PathBuilder::new();
-        pb.move_to(0.0 + dx, h + dy);
-
-        for (i, &value) in spectrum.waveform.iter().enumerate() {
-            let x = i as f32 * step + dx;
-            let y = h - (value as f32 / 255.0) * h * 0.3 + dy;
-            pb.line_to(x, y);
+        // 节拍时全屏闪光
+        if beat.is_beat {
+            let flash_alpha = (beat.intensity * 0.08 * 255.0) as u8;
+            let flash = Color::from_rgba8(255, 255, 255, flash_alpha);
+            self.pixmap.fill(flash);
         }
-
-        pb.line_to(w + dx, h + dy);
-        pb.close();
-
-        let path = pb.finish().unwrap();
-        let (min_hue, max_hue) = self.config.hue_range;
-
-        // 线性渐变（底部到中部）
-        let paint = create_linear_gradient(
-            0.0,
-            h + dy,
-            0.0,
-            h * 0.5 + dy,
-            hsl_to_rgba(min_hue, 0.8, 0.5, (0.3 * 255.0) as u8),
-            hsl_to_rgba(max_hue, 0.8, 0.5, (0.05 * 255.0) as u8),
-        );
-
-        self.pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
     }
 
     fn draw_particles(&mut self, dx: f32, dy: f32) {
@@ -504,32 +440,6 @@ fn hsl_to_rgba(h: f32, s: f32, l: f32, a: u8) -> Color {
     let b = ((b1 + m) * 255.0).round() as u8;
 
     Color::from_rgba8(r, g, b, a)
-}
-
-fn create_linear_gradient(
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    color1: Color,
-    color2: Color,
-) -> Paint<'static> {
-    let shader = LinearGradient::new(
-        Point::from_xy(x1, y1),
-        Point::from_xy(x2, y2),
-        vec![
-            GradientStop::new(0.0, color1),
-            GradientStop::new(1.0, color2),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or(Shader::SolidColor(color2));
-
-    Paint {
-        shader,
-        ..Default::default()
-    }
 }
 
 fn draw_radial_gradient_circle(

@@ -80,9 +80,6 @@ export class OfflineRenderer {
     // 辉光
     this.renderGlow(spectrum, beat)
 
-    // 波形
-    this.renderWaveform(spectrum)
-
     // 粒子
     this.renderParticles()
 
@@ -252,28 +249,6 @@ export class OfflineRenderer {
       ctx.fillStyle = coreGradient
       ctx.fillRect(cx - glowRadius * 0.4, cy - glowRadius * 0.4, glowRadius * 0.8, glowRadius * 0.8)
     }
-  }
-
-  private renderWaveform(spectrum: ReturnType<OfflineRenderer['computeSpectrum']>): void {
-    const ctx = this.ctx
-    const w = this.width
-    const h = this.height
-    const data = spectrum.waveform
-    const step = w / data.length
-
-    ctx.beginPath()
-    ctx.moveTo(0, h)
-    for (let i = 0; i < data.length; i++) {
-      ctx.lineTo(i * step, h - (data[i] / 255) * h * 0.3)
-    }
-    ctx.lineTo(w, h)
-    ctx.closePath()
-
-    const gradient = ctx.createLinearGradient(0, h, 0, h * 0.5)
-    gradient.addColorStop(0, `hsla(${this.config.hueRange[0]}, 80%, 50%, 0.3)`)
-    gradient.addColorStop(1, `hsla(${this.config.hueRange[1]}, 80%, 50%, 0.05)`)
-    ctx.fillStyle = gradient
-    ctx.fill()
   }
 
   private renderParticles(): void {

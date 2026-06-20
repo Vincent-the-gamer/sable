@@ -1,15 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import AudioLoader from "./components/AudioLoader.vue";
 import EffectStudio from "./components/EffectStudio.vue";
-import ExportPanel from "./components/ExportPanel.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import DebugPage from "./components/DebugPage.vue";
 import { AudioEngine } from "./engine/AudioEngine";
 import { BeatDetector } from "./engine/BeatDetector";
-import { VisualizerEngine } from "./engine/VisualizerEngine";
+import { WebGLFluidEngine } from "./engine/WebGLFluidEngine";
 import { ExportPipeline } from "./engine/ExportPipeline";
 import type {
     SpectrumData,
@@ -20,13 +19,13 @@ import type {
 import type { ExportProgress as ExportProgressData } from "./engine/ExportPipeline";
 
 // ═══════════ Pages ═══════════
-type Page = "home" | "studio" | "export" | "settings" | "debug";
+type Page = "home" | "studio" | "settings" | "debug";
 const currentPage = ref<Page>("home");
 
 // ═══════════ Audio Engine ═══════════
 const audioEngine = new AudioEngine();
 const beatDetector = new BeatDetector();
-const visualizer = ref<VisualizerEngine | null>(null);
+const visualizer = ref<WebGLFluidEngine | null>(null);
 
 const isPlaying = ref(false);
 const currentTime = ref(0);
@@ -78,6 +77,11 @@ function startTimeTracker() {
             latestSpectrum.value = audioEngine.getSpectrumData();
             if (latestSpectrum.value)
                 latestBeat.value = beatDetector.detect(latestSpectrum.value);
+        } else {
+            // Audio ended naturally (onended)
+            isPlaying.value = false;
+            latestSpectrum.value = null;
+            stopTimeTracker();
         }
     }, 16);
 }
@@ -103,8 +107,9 @@ async function onFileLoaded(file: File, path: string) {
 
 function initVisualizer(canvas: HTMLCanvasElement) {
     visualizer.value?.stop();
-    visualizer.value = new VisualizerEngine(canvas);
-    visualizer.value.config = { ...visualizerConfig.value };
+    visualizer.value = new WebGLFluidEngine(canvas, {
+        ...visualizerConfig.value,
+    });
     visualizer.value.start(
         () => latestSpectrum.value,
         () => latestBeat.value,
@@ -120,6 +125,7 @@ function play() {
 function pause() {
     audioEngine.pause();
     isPlaying.value = false;
+    latestSpectrum.value = null;
     stopTimeTracker();
 }
 
@@ -208,17 +214,15 @@ function cancelExport() {
     exportProgress.value = null;
 }
 
-function onUpdateConfig(cfg: VisualizerConfig) {
-    // Only update the ref — VisualizerCanvas watch will sync to engine
-    visualizerConfig.value = cfg;
+function resetExport() {
+    exportDone.value = false;
+    previewVideoUrl.value = "";
+    exportVideoPath.value = "";
 }
 
-// Stop visualizer when leaving studio page
-watch(currentPage, (_, oldPage) => {
-    if (oldPage === "studio") {
-        visualizer.value?.stop();
-    }
-});
+function onUpdateConfig(cfg: VisualizerConfig) {
+    visualizerConfig.value = cfg;
+}
 
 function onUpdateExportSettings(s: ExportSettings) {
     exportSettings.value = s;
@@ -281,27 +285,7 @@ onUnmounted(() => {
                         <circle cx="12" cy="12" r="10" />
                         <path d="M12 6v6l4 2" />
                     </svg>
-                    特效
-                </button>
-                <button
-                    class="nav-item"
-                    :class="{ active: currentPage === 'export' }"
-                    :disabled="!hasAudio"
-                    @click="currentPage = 'export'"
-                >
-                    <svg
-                        viewBox="0 0 24 24"
-                        width="18"
-                        height="18"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                    >
-                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
-                        <polyline points="7 10 12 15 17 10" />
-                        <line x1="12" y1="15" x2="12" y2="3" />
-                    </svg>
-                    导出
+                    工作室
                 </button>
                 <div class="nav-separator" />
                 <button
@@ -346,7 +330,7 @@ onUnmounted(() => {
                 </button>
             </nav>
             <div class="sidebar-footer">
-                <span class="version">v0.2.0</span>
+                <span class="version">v0.3.0</span>
             </div>
         </aside>
 
@@ -358,7 +342,7 @@ onUnmounted(() => {
                 <p v-if="!hasAudio" class="hint-text">导入音频文件开始创作</p>
             </div>
 
-            <!-- Page: Studio (Effect Config + Preview) -->
+            <!-- Page: Studio (Unified Preview + Export) -->
             <EffectStudio
                 v-if="currentPage === 'studio'"
                 :config="visualizerConfig"
@@ -367,121 +351,23 @@ onUnmounted(() => {
                 :duration="duration"
                 :has-audio="hasAudio"
                 :engine="visualizer"
+                :export-settings="exportSettings"
+                :is-exporting="isExporting"
+                :export-progress="exportProgress"
+                :export-done="exportDone"
+                :export-video-path="exportVideoPath"
+                :preview-video-url="previewVideoUrl"
                 @update:config="onUpdateConfig"
+                @update:export-settings="onUpdateExportSettings"
                 @play="play"
                 @pause="pause"
                 @seek="seek"
                 @canvas-ready="initVisualizer"
+                @select-output-path="selectOutputPath"
+                @start-export="startExport"
+                @cancel-export="cancelExport"
+                @reset-export="resetExport"
             />
-
-            <!-- Page: Export -->
-            <div v-if="currentPage === 'export'" class="export-page">
-                <div class="export-center">
-                    <!-- Select output path -->
-                    <div
-                        v-if="!isExporting && !exportDone"
-                        class="export-section"
-                    >
-                        <h2 class="export-title">导出视频</h2>
-                        <p class="export-desc">选择保存位置后开始渲染</p>
-                        <div class="export-actions">
-                            <button
-                                class="btn-secondary"
-                                @click="selectOutputPath"
-                            >
-                                {{
-                                    exportVideoPath
-                                        ? "✓ " +
-                                          exportVideoPath.split("/").pop()
-                                        : "选择保存位置..."
-                                }}
-                            </button>
-                            <button
-                                class="btn-primary btn-large"
-                                :disabled="!exportVideoPath"
-                                @click="startExport"
-                            >
-                                🎬 开始导出
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- Exporting: progress -->
-                    <div
-                        v-if="isExporting && exportProgress"
-                        class="export-section"
-                    >
-                        <h2 class="export-title">
-                            {{
-                                exportProgress.stage === "encoding"
-                                    ? "编码中..."
-                                    : exportProgress.stage === "decoding"
-                                      ? "解码音频..."
-                                      : "渲染中..."
-                            }}
-                        </h2>
-                        <div class="progress-area">
-                            <div class="progress-track">
-                                <div
-                                    class="progress-fill"
-                                    :style="{
-                                        width: exportProgress.percent + '%',
-                                    }"
-                                />
-                            </div>
-                            <span class="progress-pct"
-                                >{{ exportProgress.percent }}%</span
-                            >
-                        </div>
-                        <p class="progress-detail">
-                            帧 {{ exportProgress.currentFrame }} /
-                            {{ exportProgress.totalFrames }}
-                        </p>
-                        <button class="btn-cancel" @click="cancelExport">
-                            ✕ 取消导出
-                        </button>
-                    </div>
-
-                    <!-- Export done: preview -->
-                    <div
-                        v-if="exportDone && previewVideoUrl"
-                        class="export-section"
-                    >
-                        <h2 class="export-title">✅ 导出完成</h2>
-                        <div class="preview-box">
-                            <video
-                                :src="previewVideoUrl"
-                                controls
-                                autoplay
-                                loop
-                                class="preview-video"
-                            />
-                        </div>
-                        <p class="export-desc">
-                            {{ exportVideoPath.split("/").pop() }}
-                        </p>
-                        <div class="export-actions">
-                            <button
-                                class="btn-secondary"
-                                @click="
-                                    exportDone = false;
-                                    previewVideoUrl = '';
-                                    exportVideoPath = '';
-                                "
-                            >
-                                🎬 重新导出
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Export settings panel (right side) -->
-                <ExportPanel
-                    v-if="!isExporting"
-                    :settings="exportSettings"
-                    @update:settings="onUpdateExportSettings"
-                />
-            </div>
 
             <!-- Page: Settings -->
             <div v-if="currentPage === 'settings'" class="page-container">
@@ -522,13 +408,11 @@ body,
     height: 100%;
     overflow: hidden;
     background: #0a0a14;
-    color: #f0f0f0;
+    color: rgba(255, 255, 255, 0.8);
     font-family:
-        "Inter",
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
+        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
 }
 
 .app-shell {
@@ -537,100 +421,99 @@ body,
     height: 100%;
 }
 
-/* ═══════ Sidebar ═══════ */
-
+/* Sidebar */
 .sidebar {
-    width: 200px;
+    width: 64px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    background: rgba(15, 15, 30, 0.8);
+    align-items: center;
+    background: rgba(10, 10, 20, 0.95);
     border-right: 1px solid rgba(255, 255, 255, 0.06);
-    padding: 20px 12px;
+    padding: 16px 0;
     z-index: 20;
 }
 
 .sidebar-brand {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 10px;
-    padding: 0 8px 20px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    margin-bottom: 12px;
+    gap: 2px;
+    margin-bottom: 20px;
 }
 
 .brand-icon {
-    font-size: 18px;
+    font-size: 20px;
     color: #a855f7;
 }
 
 .brand-name {
-    font-size: 16px;
-    font-weight: 700;
-    color: rgba(255, 255, 255, 0.85);
-    letter-spacing: 0.03em;
+    font-size: 10px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.4);
+    letter-spacing: 0.1em;
 }
 
 .sidebar-nav {
-    flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 6px;
+    flex: 1;
 }
 
 .nav-item {
     display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
+    gap: 4px;
+    padding: 10px 0;
+    width: 56px;
     border: none;
-    border-radius: 8px;
+    border-radius: 10px;
     background: transparent;
-    color: rgba(255, 255, 255, 0.45);
-    font-size: 14px;
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 10px;
     cursor: pointer;
     transition: all 0.15s;
-    text-align: left;
 }
 
 .nav-item:hover:not(:disabled) {
+    color: rgba(255, 255, 255, 0.7);
     background: rgba(255, 255, 255, 0.04);
-    color: rgba(255, 255, 255, 0.75);
 }
 
 .nav-item.active {
-    background: rgba(168, 85, 247, 0.12);
-    color: rgba(255, 255, 255, 0.9);
+    color: #a855f7;
+    background: rgba(168, 85, 247, 0.1);
 }
 
 .nav-item:disabled {
-    opacity: 0.25;
+    opacity: 0.2;
     cursor: not-allowed;
 }
 
 .nav-separator {
     height: 1px;
-    background: rgba(255, 255, 255, 0.05);
-    margin: 8px 8px;
+    background: rgba(255, 255, 255, 0.06);
+    margin: 4px 8px;
 }
 
 .sidebar-footer {
-    padding: 12px 8px 0;
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    margin-top: auto;
 }
 
 .version {
-    font-size: 11px;
-    color: rgba(255, 255, 255, 0.2);
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.15);
+    font-family: "SF Mono", monospace;
 }
 
-/* ═══════ Main Content ═══════ */
-
+/* Main Content */
 .main-content {
     flex: 1;
-    display: flex;
-    overflow: hidden;
     min-width: 0;
+    position: relative;
+    overflow: hidden;
 }
 
 .page-container {
@@ -640,173 +523,17 @@ body,
 }
 
 .page-center {
-    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 16px;
-    padding: 40px;
+    width: 100%;
+    height: 100%;
+    gap: 24px;
 }
 
 .hint-text {
     font-size: 13px;
     color: rgba(255, 255, 255, 0.2);
-    margin-top: 8px;
-}
-
-/* ═══════ Export Page ═══════ */
-
-.export-page {
-    display: flex;
-    width: 100%;
-    height: 100%;
-}
-
-.export-center {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-    min-width: 0;
-}
-
-.export-section {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 16px;
-    width: 100%;
-    max-width: 460px;
-}
-
-.export-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.85);
-}
-
-.export-desc {
-    font-size: 13px;
-    color: rgba(255, 255, 255, 0.35);
-}
-
-.export-actions {
-    display: flex;
-    gap: 12px;
-    margin-top: 8px;
-}
-
-.progress-area {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    width: 100%;
-}
-
-.progress-track {
-    flex: 1;
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(255, 255, 255, 0.08);
-    overflow: hidden;
-}
-
-.progress-fill {
-    height: 100%;
-    border-radius: 3px;
-    background: linear-gradient(90deg, #6366f1, #a855f7);
-    transition: width 0.3s ease;
-}
-
-.progress-pct {
-    font-size: 14px;
-    color: rgba(255, 255, 255, 0.5);
-    font-variant-numeric: tabular-nums;
-    min-width: 42px;
-    text-align: right;
-}
-
-.progress-detail {
-    font-size: 12px;
-    color: rgba(255, 255, 255, 0.25);
-}
-
-.preview-box {
-    width: 100%;
-    max-width: 480px;
-    border-radius: 10px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    background: #000;
-}
-
-.preview-video {
-    width: 100%;
-    display: block;
-}
-
-/* ═══════ Buttons ═══════ */
-
-.btn-secondary {
-    padding: 10px 20px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.04);
-    color: rgba(255, 255, 255, 0.75);
-    cursor: pointer;
-    font-size: 13px;
-    white-space: nowrap;
-    transition: all 0.2s;
-}
-
-.btn-secondary:hover {
-    background: rgba(255, 255, 255, 0.08);
-}
-
-.btn-primary {
-    padding: 10px 24px;
-    border: none;
-    border-radius: 9px;
-    background: linear-gradient(135deg, #6366f1, #a855f7);
-    color: white;
-    cursor: pointer;
-    font-size: 14px;
-    font-weight: 600;
-    white-space: nowrap;
-    transition: all 0.2s;
-}
-
-.btn-primary.btn-large {
-    padding: 14px 36px;
-    font-size: 16px;
-}
-
-.btn-primary:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 18px rgba(99, 102, 241, 0.35);
-}
-
-.btn-primary:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-}
-
-.btn-cancel {
-    padding: 8px 20px;
-    border: 1px solid rgba(255, 100, 100, 0.3);
-    border-radius: 8px;
-    background: rgba(255, 60, 60, 0.12);
-    color: rgba(255, 160, 160, 0.85);
-    cursor: pointer;
-    font-size: 13px;
-    transition: all 0.2s;
-}
-
-.btn-cancel:hover {
-    background: rgba(255, 60, 60, 0.22);
-    border-color: rgba(255, 100, 100, 0.5);
 }
 </style>

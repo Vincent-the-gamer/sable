@@ -19,6 +19,9 @@ export class AudioEngine {
   private _isPlaying = false
   private _duration = 0
 
+  /** 防止 onended 竞态：每次 play() 递增，onended 只处理当前 sourceId */
+  private sourceId = 0
+
   /** 频谱 FFT 尺寸 (必须是 2 的幂) */
   private readonly FFT_SIZE = 256
 
@@ -33,7 +36,9 @@ export class AudioEngine {
   get currentTime(): number {
     if (!this.ctx || !this.buffer) return 0
     if (this._isPlaying) {
-      return this.ctx.currentTime - this.startedAt + this.pausedAt
+      // startedAt = ctxTimeAtPlayStart - pausedAt
+      // so currentTime = ctxTime - startedAt = elapsed + pausedAt ✓
+      return this.ctx.currentTime - this.startedAt
     }
     return this.pausedAt
   }
@@ -83,22 +88,27 @@ export class AudioEngine {
 
     this.stopSource()
 
-    this.source = this.ctx.createBufferSource()
-    this.source.buffer = this.buffer
+    const sid = ++this.sourceId
+    const source = this.ctx.createBufferSource()
+    source.buffer = this.buffer
 
-    this.source.connect(this.analyser)
+    source.connect(this.analyser)
     this.analyser.connect(this.gainNode)
     this.gainNode.connect(this.ctx.destination)
 
-    this.source.start(0, this.pausedAt)
+    source.start(0, this.pausedAt)
     this.startedAt = this.ctx.currentTime - this.pausedAt
     this._isPlaying = true
+    this.source = source
 
-    this.source.onended = () => {
-      if (this._isPlaying && this.pausedAt < this._duration) {
-        // naturally ended
-      }
+    source.onended = () => {
+      // 只处理当前 source，忽略旧 source 的 onended
+      if (this.sourceId !== sid) return
       this._isPlaying = false
+      // 自然播完时记录进度到末尾
+      if (this.pausedAt < this._duration) {
+        this.pausedAt = this._duration
+      }
     }
   }
 
@@ -120,8 +130,12 @@ export class AudioEngine {
   /** 跳转到指定时间（秒） */
   seek(time: number): void {
     const wasPlaying = this._isPlaying
-    this.pause()
+    // 先记录目标位置
     this.pausedAt = Math.max(0, Math.min(time, this._duration))
+    // 停止当前 source（递增 sourceId，使旧 onended 失效）
+    this.sourceId++
+    this.stopSource()
+    this._isPlaying = false
     if (wasPlaying) {
       this.play()
     }
