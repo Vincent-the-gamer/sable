@@ -378,17 +378,20 @@ export class WebGLFluidEngine {
   // Config
   config: VisualizerConfig
   private fluidConfig = {
-    DENSITY_DISSIPATION: 1.0,
-    VELOCITY_DISSIPATION: 0.2,
-    PRESSURE: 0.8,
+    DENSITY_DISSIPATION: 2.5,
+    VELOCITY_DISSIPATION: 0.3,
+    PRESSURE: 0.85,
     PRESSURE_ITERATIONS: 20,
-    CURL: 30,
-    SPLAT_RADIUS: 0.25,
-    SPLAT_FORCE: 6000,
-    BLOOM_INTENSITY: 0.8,
-    BLOOM_THRESHOLD: 0.6,
+    CURL: 28,
+    SPLAT_RADIUS: 0.18,
+    SPLAT_FORCE: 2500,
+    BLOOM_INTENSITY: 0.65,
+    BLOOM_THRESHOLD: 0.55,
     BLOOM_SOFT_KNEE: 0.7,
   }
+
+  // 缓存的音频能量，供 step() 动态调参
+  private currentAudioEnergy = 0
 
   // Audio-driven
   private bandPositions: { x: number; y: number; color: [number, number, number] }[] = []
@@ -399,6 +402,7 @@ export class WebGLFluidEngine {
   constructor(canvas: HTMLCanvasElement, config: VisualizerConfig) {
     this.canvas = canvas
     this.config = { ...config }
+    this.applyConfig()
 
     // 尝试 WebGL2，回退到 WebGL1
     const gl = canvas.getContext('webgl2', {
@@ -440,9 +444,7 @@ export class WebGLFluidEngine {
       })
     }
 
-    // 初始随机 splat
-    this.multipleSplats(Math.floor(Math.random() * 20) + 5)
-
+    // 静默启动 — 无初始 splat
     console.log('[WebGLFluid] 初始化完成, WebGL' + (this.isWebGL2 ? '2' : '1'),
       'canvas:', this.displayWidth, 'x', this.displayHeight)
   }
@@ -737,9 +739,15 @@ export class WebGLFluidEngine {
 
   // ═══════════ 模拟核心 ═══════════
 
-  private step(dt: number) {
+  // audioEnergy: 0~1 整体音频能量，用于动态调制涡度和速度消散
+  private step(dt: number, audioEnergy = 0) {
     const gl = this.gl
     gl.disable(gl.BLEND)
+
+    // 动态参数：音频越强 → 涡旋越强、速度消散越慢、压力迭代越多
+    const dynCurl = this.fluidConfig.CURL * (0.6 + audioEnergy * 1.4)   // 17~39
+    const dynVelDissipation = this.fluidConfig.VELOCITY_DISSIPATION * (1.5 - audioEnergy * 1.0)  // 0.15~0.45
+    const dynPressureIters = Math.round(this.fluidConfig.PRESSURE_ITERATIONS * (0.8 + audioEnergy * 0.6))  // 16~28
 
     // 1. Curl
     gl.useProgram(this.curlProgram)
@@ -752,7 +760,7 @@ export class WebGLFluidEngine {
     this.setUniform2f(this.vorticityProgram, 'texelSize', this.velocity.texelSizeX, this.velocity.texelSizeY)
     this.setTexture(this.vorticityProgram, 'uVelocity', this.velocity.read, 0)
     this.setTexture(this.vorticityProgram, 'uCurl', this.curlFBO, 1)
-    this.setUniform1f(this.vorticityProgram, 'curl', this.fluidConfig.CURL)
+    this.setUniform1f(this.vorticityProgram, 'curl', dynCurl)
     this.setUniform1f(this.vorticityProgram, 'dt', dt)
     this.blit(this.velocity.write)
     this.velocity.swap()
@@ -774,7 +782,7 @@ export class WebGLFluidEngine {
     gl.useProgram(this.pressureProgram)
     this.setUniform2f(this.pressureProgram, 'texelSize', this.velocity.texelSizeX, this.velocity.texelSizeY)
     this.setTexture(this.pressureProgram, 'uDivergence', this.divergenceFBO, 0)
-    for (let i = 0; i < this.fluidConfig.PRESSURE_ITERATIONS; i++) {
+    for (let i = 0; i < dynPressureIters; i++) {
       this.setTexture(this.pressureProgram, 'uPressure', this.pressure.read, 1)
       this.blit(this.pressure.write)
       this.pressure.swap()
@@ -794,7 +802,7 @@ export class WebGLFluidEngine {
     this.setTexture(this.advectionProgram, 'uVelocity', this.velocity.read, 0)
     this.setTexture(this.advectionProgram, 'uSource', this.velocity.read, 0)
     this.setUniform1f(this.advectionProgram, 'dt', dt)
-    this.setUniform1f(this.advectionProgram, 'dissipation', this.fluidConfig.VELOCITY_DISSIPATION)
+    this.setUniform1f(this.advectionProgram, 'dissipation', dynVelDissipation)
     this.blit(this.velocity.write)
     this.velocity.swap()
 
@@ -841,19 +849,6 @@ export class WebGLFluidEngine {
     const aspectRatio = this.canvas.width / this.canvas.height
     if (aspectRatio > 1) radius *= aspectRatio
     return radius
-  }
-
-  private multipleSplats(amount: number) {
-    for (let i = 0; i < amount; i++) {
-      const color = this.generateColor()
-      // 初始 splat 颜色更亮
-      color[0] *= 10.0; color[1] *= 10.0; color[2] *= 10.0
-      const x = Math.random()
-      const y = Math.random()
-      const dx = 1000 * (Math.random() - 0.5)
-      const dy = 1000 * (Math.random() - 0.5)
-      this.splat(x, y, dx, dy, color)
-    }
   }
 
   // ═══════════ Bloom ═══════════
@@ -919,11 +914,15 @@ export class WebGLFluidEngine {
     // 1. Bloom
     this.applyBloom(this.dye, this.bloom)
 
-    // 2. Display
+    // 2. 先清除屏幕为黑色（Pavel 原版：先画背景色再叠流体）
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, this.displayWidth, this.displayHeight)
+    gl.clearColor(0.0, 0.0, 0.0, 1.0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+
+    // 3. 用 alpha blending 叠上流体
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
     gl.enable(gl.BLEND)
-
-    this.blit(null, false)
 
     gl.useProgram(this.displayProgram)
     this.setUniform2f(this.displayProgram, 'texelSize', 1.0 / this.displayWidth, 1.0 / this.displayHeight)
@@ -975,6 +974,15 @@ export class WebGLFluidEngine {
       const spectrum = getSpectrum()
       const beat = getBeat()
 
+      // 计算整体音频能量（给 step 做动态物理调制）
+      if (spectrum) {
+        // 平滑过渡
+        this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * 0.15
+      } else {
+        // 无音频时逐渐归零
+        this.currentAudioEnergy *= 0.9
+      }
+
       // 颜色变换
       this.updateColors(dt)
 
@@ -989,8 +997,8 @@ export class WebGLFluidEngine {
       }
       this.pendingSplats = []
 
-      // 模拟步进
-      this.step(dt)
+      // 模拟步进 — 传入音频能量以同步流体动力学
+      this.step(dt, this.currentAudioEnergy)
 
       if (this.displayWidth > 0 && this.displayHeight > 0) {
         this.renderDisplay()
@@ -1007,6 +1015,26 @@ export class WebGLFluidEngine {
   stop(): void {
     this.running = false
     cancelAnimationFrame(this.animFrameId)
+  }
+
+  // ═══════════ 配置更新 ═══════════
+
+  /** 从外部 UI 面板同步配置变更 */
+  updateConfig(cfg: VisualizerConfig): void {
+    this.config = { ...cfg }
+    this.applyConfig()
+  }
+
+  /** 将 VisualizerConfig 映射到流体物理参数 */
+  private applyConfig(): void {
+    const c = this.config
+    // glowIntensity 0~2 → bloom 0.3~1.3
+    this.fluidConfig.BLOOM_INTENSITY = 0.3 + c.glowIntensity * 0.5
+    // shakeIntensity 0~2 → curl 10~50, velocity dissipation 0.5~0.1
+    this.fluidConfig.CURL = 10 + c.shakeIntensity * 20
+    this.fluidConfig.VELOCITY_DISSIPATION = 0.5 - c.shakeIntensity * 0.2
+    // shakeIntensity also affects force
+    this.fluidConfig.SPLAT_FORCE = 1500 + c.shakeIntensity * 1500
   }
 
   // 手动触发随机 splat（空格键等）
@@ -1038,7 +1066,8 @@ export class WebGLFluidEngine {
   }
 
   private generateColor(): [number, number, number] {
-    const h = Math.random()
+    const [minHue, maxHue] = this.config.hueRange
+    const h = (minHue + Math.random() * (maxHue - minHue)) / 360
     const c = this.hsvToRgb(h, 1.0, 1.0)
     return [c[0] * 0.15, c[1] * 0.15, c[2] * 0.15]
   }
@@ -1066,6 +1095,12 @@ export class WebGLFluidEngine {
   private generateAudioSplats(spectrum: SpectrumData, beat: BeatResult, dt: number) {
     const freq = spectrum.frequency
     const bandCount = 8
+    const ENERGY_THRESHOLD = 0.04  // 降低阈值，更多频段参与
+
+    // 整体平均能量，用于控制动态级别
+    let totalEnergy = 0
+    for (let i = 0; i < freq.length; i++) totalEnergy += freq[i]
+    const avgEnergy = totalEnergy / (freq.length * 255)
 
     for (let b = 0; b < bandCount; b++) {
       const binStart = Math.floor((freq.length / bandCount) * b)
@@ -1074,33 +1109,60 @@ export class WebGLFluidEngine {
       for (let i = binStart; i < binEnd; i++) bandSum += freq[i]
       const bandEnergy = bandSum / ((binEnd - binStart) * 255)
 
+      if (bandEnergy < ENERGY_THRESHOLD) continue
+
       const bp = this.bandPositions[b]
       const color = bp.color
 
-      // 位置缓慢游走
-      const wanderSpeed = dt * (0.3 + bandEnergy * 2.0)
+      // 更大范围的随机游走，让位置更多变
+      const wanderSpeed = dt * (0.5 + bandEnergy * 3.0)
       bp.x += (Math.random() - 0.5) * wanderSpeed
       bp.y += (Math.random() - 0.5) * wanderSpeed
-      bp.x = Math.max(0.05, Math.min(0.95, bp.x))
-      bp.y = Math.max(0.05, Math.min(0.95, bp.y))
 
-      // 根据能量注入 splat
-      const count = Math.ceil(bandEnergy * 3)
+      // 偶尔大幅跳跃
+      if (Math.random() < bandEnergy * 0.3) {
+        bp.x += (Math.random() - 0.5) * 0.3
+        bp.y += (Math.random() - 0.5) * 0.3
+      }
+
+      bp.x = Math.max(0.03, Math.min(0.97, bp.x))
+      bp.y = Math.max(0.03, Math.min(0.97, bp.y))
+
+      // 增加 splat 数量
+      const count = Math.ceil(bandEnergy * 3.0)
       for (let j = 0; j < count; j++) {
-        const sx = bp.x + (Math.random() - 0.5) * 0.15
-        const sy = bp.y + (Math.random() - 0.5) * 0.15
+        // 更大的散布半径
+        const sx = bp.x + (Math.random() - 0.5) * (0.2 + bandEnergy * 0.3)
+        const sy = bp.y + (Math.random() - 0.5) * (0.2 + bandEnergy * 0.3)
 
-        // 螺旋方向的速度，创造漩涡效果
-        const phase = this.time * 3 + b * 0.8
-        const spiralAngle = phase + (Math.random() - 0.5) * 1.5
-        const forceMagnitude = this.fluidConfig.SPLAT_FORCE * bandEnergy
-        const dx = Math.cos(spiralAngle) * forceMagnitude
-        const dy = Math.sin(spiralAngle) * forceMagnitude
+        // 多样化的速度方向
+        const r = Math.random()
+        let dx: number, dy: number
+        if (r < 0.4) {
+          // 螺旋
+          const phase = this.time * 2.5 + b * 0.7
+          const angle = phase + (Math.random() - 0.5) * 2.0
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy
+          dx = Math.cos(angle) * fm
+          dy = Math.sin(angle) * fm
+        } else if (r < 0.7) {
+          // 径向（从频段中心向外）
+          const angle = Math.random() * Math.PI * 2
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 0.8
+          dx = Math.cos(angle) * fm
+          dy = Math.sin(angle) * fm
+        } else {
+          // 随机方向
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 1.2
+          dx = (Math.random() - 0.5) * fm * 2
+          dy = (Math.random() - 0.5) * fm * 2
+        }
 
+        const brightness = 0.15 + bandEnergy * 1.5
         const boostedColor: [number, number, number] = [
-          color[0] * (1 + bandEnergy * 2),
-          color[1] * (1 + bandEnergy * 2),
-          color[2] * (1 + bandEnergy * 2),
+          color[0] * brightness,
+          color[1] * brightness,
+          color[2] * brightness,
         ]
 
         this.pendingSplats.push({
@@ -1112,19 +1174,41 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 节拍爆发
-    if (beat.isBeat) {
-      const burstCount = 8 + Math.floor(beat.intensity * 12)
-      for (let i = 0; i < burstCount; i++) {
+    // 全局随机散布：在无特定频段关联的位置随机注入
+    if (avgEnergy > 0.06) {
+      const scatterCount = Math.ceil(avgEnergy * 6)
+      for (let i = 0; i < scatterCount; i++) {
         const color = this.generateColor()
-        color[0] *= 1 + beat.intensity * 3
-        color[1] *= 1 + beat.intensity * 3
-        color[2] *= 1 + beat.intensity * 3
+        const brightness = 0.08 + avgEnergy * 0.8
+        color[0] *= brightness
+        color[1] *= brightness
+        color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity
+        const fm = this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.5
         this.pendingSplats.push({
           x: Math.random(),
           y: Math.random(),
+          dx: Math.cos(angle) * fm + (Math.random() - 0.5) * fm,
+          dy: Math.sin(angle) * fm + (Math.random() - 0.5) * fm,
+          color,
+        })
+      }
+    }
+
+    // 节拍爆发
+    if (beat.isBeat && beat.intensity > 0.25) {
+      const burstCount = 5 + Math.floor(beat.intensity * 10)
+      for (let i = 0; i < burstCount; i++) {
+        const color = this.generateColor()
+        const brightness = 0.25 + beat.intensity * 1.5
+        color[0] *= brightness
+        color[1] *= brightness
+        color[2] *= brightness
+        const angle = Math.random() * Math.PI * 2
+        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.6
+        this.pendingSplats.push({
+          x: 0.2 + Math.random() * 0.6,   // 偏中心区域
+          y: 0.2 + Math.random() * 0.6,
           dx: Math.cos(angle) * speed,
           dy: Math.sin(angle) * speed,
           color,

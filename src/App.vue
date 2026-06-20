@@ -222,6 +222,7 @@ function resetExport() {
 
 function onUpdateConfig(cfg: VisualizerConfig) {
     visualizerConfig.value = cfg;
+    visualizer.value?.updateConfig(cfg);
 }
 
 function onUpdateExportSettings(s: ExportSettings) {
