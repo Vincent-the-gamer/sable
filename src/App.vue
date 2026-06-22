@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import AudioLoader from "./components/AudioLoader.vue";
@@ -9,6 +9,7 @@ import DebugPage from "./components/DebugPage.vue";
 import { AudioEngine } from "./engine/AudioEngine";
 import { BeatDetector } from "./engine/BeatDetector";
 import { WebGLFluidEngine } from "./engine/WebGLFluidEngine";
+import { SpectrumRenderer } from "./engine/SpectrumRenderer";
 import { ExportPipeline } from "./engine/ExportPipeline";
 import { LrcParser } from "./engine/LrcParser";
 import type {
@@ -18,8 +19,9 @@ import type {
     ExportSettings,
     LyricLine,
     SubtitleConfig,
+    SpectrumConfig,
 } from "./types";
-import { DEFAULT_SUBTITLE_CONFIG } from "./types";
+import { DEFAULT_SUBTITLE_CONFIG, DEFAULT_SPECTRUM_CONFIG } from "./types";
 import type { ExportProgress as ExportProgressData } from "./engine/ExportPipeline";
 
 // ═══════════ Pages ═══════════
@@ -30,6 +32,7 @@ const currentPage = ref<Page>("home");
 const audioEngine = new AudioEngine();
 const beatDetector = new BeatDetector();
 const visualizer = ref<WebGLFluidEngine | null>(null);
+const spectrumRenderer = ref<SpectrumRenderer | null>(null);
 
 const isPlaying = ref(false);
 const currentTime = ref(0);
@@ -46,14 +49,23 @@ const visualizerConfig = ref<VisualizerConfig>({
     glowIntensity: 1.0,
     shakeIntensity: 1.0,
     hue: 260,
+    hueSpread: 60,
+    fluidIntensity: 1.0,
+    fluidActivity: 1.0,
+    hueRotate: false,
+    hueRotateSpeed: 1.0,
+    beatEdgeEnabled: true,
+    beatEdgeSensitivity: 1.0,
 });
 
 const exportSettings = ref<ExportSettings>({
     width: 1920,
     height: 1080,
     fps: 30,
+    encoder: "videotoolbox_h264",
     format: "mp4",
     crf: 23,
+    speedPreset: "ultrafast",
 });
 
 // ═══════════ Export State ═══════════
@@ -70,6 +82,8 @@ const currentLyric = ref("");
 const hasLyrics = computed(() => lyrics.value.length > 0);
 
 const subtitleConfig = ref<SubtitleConfig>({ ...DEFAULT_SUBTITLE_CONFIG });
+
+const spectrumConfig = ref<SpectrumConfig>({ ...DEFAULT_SPECTRUM_CONFIG });
 
 async function onLrcLoaded(lrcContent: string) {
     lyrics.value = LrcParser.parse(lrcContent);
@@ -144,6 +158,7 @@ async function onFileLoaded(file: File, path: string) {
     currentTime.value = 0;
     loadedFilePath.value = path;
     beatDetector.reset();
+    beatDetector.sensitivity = visualizerConfig.value.beatEdgeSensitivity;
     // Auto-navigate to studio
     currentPage.value = "studio";
 }
@@ -157,6 +172,15 @@ function initVisualizer(canvas: HTMLCanvasElement) {
         () => latestSpectrum.value,
         () => latestBeat.value,
     );
+}
+
+function initSpectrumRenderer(canvas: HTMLCanvasElement) {
+    spectrumRenderer.value?.stop();
+    spectrumRenderer.value = new SpectrumRenderer(canvas, {
+        ...spectrumConfig.value,
+    });
+    spectrumRenderer.value.resize();
+    spectrumRenderer.value.start(() => latestSpectrum.value);
 }
 
 function play() {
@@ -231,7 +255,12 @@ function startExport() {
     const { cancel, done } = ExportPipeline.startExport(
         loadedFilePath.value,
         exportVideoPath.value,
-        visualizerConfig.value,
+        {
+            visualizerConfig: visualizerConfig.value,
+            spectrumConfig: spectrumConfig.value,
+            subtitleConfig: subtitleConfig.value,
+            lyrics: lyrics.value,
+        },
         exportSettings.value,
         ffmpegPath.value,
         (p) => {
@@ -275,6 +304,7 @@ function resetExport() {
 function onUpdateConfig(cfg: VisualizerConfig) {
     visualizerConfig.value = cfg;
     visualizer.value?.updateConfig(cfg);
+    beatDetector.sensitivity = cfg.beatEdgeSensitivity;
 }
 
 function onUpdateExportSettings(s: ExportSettings) {
@@ -284,11 +314,41 @@ function onUpdateExportSettings(s: ExportSettings) {
     exportDone.value = false;
 }
 
+// ═══════════ Watchers ═══════════
+watch(
+    spectrumConfig,
+    (cfg) => {
+        if (spectrumRenderer.value) {
+            spectrumRenderer.value.config = { ...cfg };
+        }
+    },
+    { deep: true },
+);
+
+// 流体色相/旋转变更时同步给频谱
+watch(
+    () =>
+        [
+            visualizerConfig.value.hue,
+            visualizerConfig.value.hueRotate,
+            visualizerConfig.value.hueRotateSpeed,
+        ] as const,
+    ([hue, hueRotate, hueRotateSpeed]) => {
+        spectrumConfig.value = {
+            ...spectrumConfig.value,
+            hue,
+            hueRotate,
+            hueRotateSpeed,
+        };
+    },
+);
+
 // ═══════════ Lifecycle ═══════════
 onMounted(() => window.addEventListener("keydown", onKeyDown));
 onUnmounted(() => {
     stopTimeTracker();
     visualizer.value?.stop();
+    spectrumRenderer.value?.stop();
     audioEngine.dispose();
     window.removeEventListener("keydown", onKeyDown);
 });
@@ -415,14 +475,21 @@ onUnmounted(() => {
                 :has-lyrics="hasLyrics"
                 :subtitle-config="subtitleConfig"
                 :latest-beat="latestBeat"
+                :spectrum-config="spectrumConfig"
                 @update:config="onUpdateConfig"
                 @update:export-settings="onUpdateExportSettings"
-                @update:subtitle-config="(c) => (subtitleConfig = c)"
+                @update:subtitle-config="
+                    (c: SubtitleConfig) => (subtitleConfig = c)
+                "
+                @update:spectrum-config="
+                    (c: SpectrumConfig) => (spectrumConfig = c)
+                "
                 @lrc-import="openLrcFile"
                 @play="play"
                 @pause="pause"
                 @seek="seek"
                 @canvas-ready="initVisualizer"
+                @spectrum-canvas-ready="initSpectrumRenderer"
                 @select-output-path="selectOutputPath"
                 @start-export="startExport"
                 @cancel-export="cancelExport"

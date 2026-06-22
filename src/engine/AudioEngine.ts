@@ -22,8 +22,9 @@ export class AudioEngine {
   /** 防止 onended 竞态：每次 play() 递增，onended 只处理当前 sourceId */
   private sourceId = 0
 
-  /** 频谱 FFT 尺寸 (必须是 2 的幂) */
-  private readonly FFT_SIZE = 256
+  /** 频谱 FFT 尺寸 (必须是 2 的幂)
+   *  1024 → 512 频率 bin，bin 宽度约 43 Hz，可分辨鼓点频段 */
+  private readonly FFT_SIZE = 1024
 
   get isPlaying(): boolean {
     return this._isPlaying
@@ -63,7 +64,7 @@ export class AudioEngine {
     // 创建分析器节点
     this.analyser = ctx.createAnalyser()
     this.analyser.fftSize = this.FFT_SIZE
-    this.analyser.smoothingTimeConstant = 0.8
+    this.analyser.smoothingTimeConstant = 0.35
 
     // 创建增益节点
     this.gainNode = ctx.createGain()
@@ -162,8 +163,10 @@ export class AudioEngine {
     }
     const averageEnergy = sum / (this.freqData.length * 255)
 
-    // 计算低频能量 (前 1/4 频率区间，对应贝斯/鼓)
-    const bassBins = Math.floor(this.freqData.length / 4)
+    // 计算低频能量（前 24 bin ≈ 0-1032 Hz，覆盖 kick/snare 频段）
+    // FFT_SIZE=1024 → 512 bin，bin 宽度 22050/512 ≈ 43 Hz
+    // bin 0-23 覆盖 0-1032 Hz，精准捕获底鼓(40-100Hz)和军鼓(200-500Hz)
+    const bassBins = Math.min(24, this.freqData.length)
     let bassSum = 0
     for (let i = 0; i < bassBins; i++) {
       bassSum += this.freqData[i]

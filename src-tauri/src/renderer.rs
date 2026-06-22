@@ -261,6 +261,7 @@ impl FrameRenderer {
         let angle = rand::thread_rng().gen_range(0.0..PI * 2.0);
         let speed = 0.5 + energy * 4.0 + rand::thread_rng().gen_range(0.0..2.0);
         let (min_hue, max_hue) = self.config.hue_range;
+        let hue_range = (max_hue - min_hue).max(0.0);
         // 全屏随机位置
         let x = rand::thread_rng().gen_range(0.0..self.width as f32);
         let y = rand::thread_rng().gen_range(0.0..self.height as f32);
@@ -273,7 +274,7 @@ impl FrameRenderer {
             life: 1.0,
             max_life: 0.6 + rand::thread_rng().gen_range(0.0..0.8),
             size: 1.0 + energy * 4.0 + rand::thread_rng().gen_range(0.0..3.0),
-            hue: min_hue + rand::thread_rng().gen_range(0.0..(max_hue - min_hue)),
+            hue: min_hue + rand::thread_rng().gen_range(0.0..hue_range.max(f32::EPSILON)),
             alpha: 0.6 + rand::thread_rng().gen_range(0.0..0.4),
         }
     }
@@ -294,8 +295,8 @@ impl FrameRenderer {
     // ══════════════════ 渲染 ══════════════════
 
     fn draw(&mut self, spectrum: &Spectrum, beat: &BeatResult) {
-        // 清屏（带拖尾）
-        let fade = Color::from_rgba8(10, 10, 20, 64);
+        // 清屏（不透明深色背景 — 离线渲染没有底层画布叠加，必须用不透明背景）
+        let fade = Color::from_rgba8(10, 10, 20, 255);
         self.pixmap.fill(fade);
 
         // 应用抖动变换（通过平移所有绘制操作）
@@ -326,36 +327,29 @@ impl FrameRenderer {
         let mid_hue = (min_hue + 40.0) % 360.0;
 
         // 全屏多个随机辉光点，随能量增多
+        // 🔥 优化：用半透明圆叠加模拟径向渐变，避免 tiny-skia RadialGradient 的昂贵逐像素计算
         let num_glows = 3 + (energy * 5.0) as usize;
         for i in 0..num_glows {
             let cx = rand::thread_rng().gen_range(0.0..self.width as f32) + dx;
             let cy = rand::thread_rng().gen_range(0.0..self.height as f32) + dy;
             let r = glow_radius * (0.5 + 0.5 * (i as f32 / num_glows as f32));
 
-            let alpha1 = (0.3 * energy * beat_boost * 255.0) as u8;
-            let color1 = hsl_to_rgba(min_hue, 1.0, 0.6, alpha1);
-
-            draw_radial_gradient_circle(
-                &mut self.pixmap,
-                cx,
-                cy,
-                0.0,
-                r * 0.5,
-                color1,
-                Color::from_rgba8(0, 0, 0, 0),
-            );
-
-            let alpha2 = (0.1 * energy * beat_boost * 255.0) as u8;
-            let color2 = hsl_to_rgba(mid_hue, 1.0, 0.5, alpha2);
-            draw_radial_gradient_circle(
-                &mut self.pixmap,
-                cx,
-                cy,
-                r * 0.3,
-                r,
-                color2,
-                Color::from_rgba8(0, 0, 0, 0),
-            );
+            // 用多层不透明度递减的圆模拟渐变效果
+            let layers = 4;
+            for l in 0..layers {
+                let t = l as f32 / layers as f32;
+                let lr = r * (1.0 - t * 0.7);
+                let alpha1 = (0.3 * energy * beat_boost * 255.0 * (1.0 - t) / layers as f32) as u8;
+                if alpha1 > 0 {
+                    let color1 = hsl_to_rgba(min_hue, 1.0, 0.6, alpha1);
+                    draw_solid_circle(&mut self.pixmap, cx, cy, lr, color1);
+                }
+                let alpha2 = (0.1 * energy * beat_boost * 255.0 * (1.0 - t) / layers as f32) as u8;
+                if alpha2 > 0 {
+                    let color2 = hsl_to_rgba(mid_hue, 1.0, 0.5, alpha2);
+                    draw_solid_circle(&mut self.pixmap, cx, cy, lr, color2);
+                }
+            }
         }
 
         // 节拍时全屏闪光
@@ -367,7 +361,7 @@ impl FrameRenderer {
     }
 
     fn draw_particles(&mut self, dx: f32, dy: f32) {
-        // 先画大光晕
+        // 先画大光晕（用半透明实心圆代替径向渐变）
         for p in &self.particles {
             let alpha = (p.alpha * p.life * 255.0) as u8;
             if alpha == 0 {
@@ -375,17 +369,18 @@ impl FrameRenderer {
             }
             let x = p.x + dx;
             let y = p.y + dy;
-            let color = hsl_to_rgba(p.hue, 1.0, 0.7, alpha);
 
-            draw_radial_gradient_circle(
-                &mut self.pixmap,
-                x,
-                y,
-                0.0,
-                p.size * 3.0,
-                color,
-                Color::from_rgba8(0, 0, 0, 0),
-            );
+            // 🔥 优化：多层递减不透明度的圆模拟径向渐变
+            let layers: usize = 3;
+            for l in 0..layers {
+                let t = l as f32 / layers as f32;
+                let lr = p.size * 3.0 * (1.0 - t * 0.75);
+                let la = (alpha as f32 * (1.0 - t) / layers as f32) as u8;
+                if la > 0 {
+                    let color = hsl_to_rgba(p.hue, 1.0, 0.7, la);
+                    draw_solid_circle(&mut self.pixmap, x, y, lr, color);
+                }
+            }
         }
 
         // 再画核心亮点（叠加）
@@ -400,16 +395,7 @@ impl FrameRenderer {
             let x = p.x + dx;
             let y = p.y + dy;
             let color = hsl_to_rgba(p.hue, 1.0, 0.85, alpha);
-
-            draw_radial_gradient_circle(
-                &mut self.pixmap,
-                x,
-                y,
-                0.0,
-                p.size * 0.5,
-                color,
-                Color::from_rgba8(0, 0, 0, 0),
-            );
+            draw_solid_circle(&mut self.pixmap, x, y, p.size * 0.5, color);
         }
     }
 }
@@ -442,40 +428,23 @@ fn hsl_to_rgba(h: f32, s: f32, l: f32, a: u8) -> Color {
     Color::from_rgba8(r, g, b, a)
 }
 
-fn draw_radial_gradient_circle(
-    pixmap: &mut Pixmap,
-    cx: f32,
-    cy: f32,
-    r_start: f32,
-    r_end: f32,
-    color_inner: Color,
-    color_outer: Color,
-) {
-    if r_end <= 0.0 {
+/// 🔥 优化：用简单实心圆替代 tiny-skia RadialGradient
+/// RadialGradient 内部对每个像素做插值计算，极其昂贵。
+/// 多层实心圆叠加效果近似且快 5-10 倍。
+fn draw_solid_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) {
+    if r <= 0.5 || color.alpha() == 0.0 {
         return;
     }
 
-    let center = Point::from_xy(cx, cy);
-
-    let shader = RadialGradient::new(
-        center,
-        center,
-        r_end,
-        vec![
-            GradientStop::new(r_start / r_end, color_inner),
-            GradientStop::new(1.0, color_outer),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    )
-    .unwrap_or(Shader::SolidColor(color_inner));
-
     let paint = Paint {
-        shader,
+        shader: Shader::SolidColor(color),
         ..Default::default()
     };
 
-    let path = PathBuilder::from_circle(cx, cy, r_end).unwrap();
+    let path = match PathBuilder::from_circle(cx, cy, r) {
+        Some(p) => p,
+        None => return,
+    };
 
     pixmap.fill_path(
         &path,

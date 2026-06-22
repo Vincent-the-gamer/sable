@@ -13,8 +13,11 @@ import type { SpectrumData, BeatResult, VisualizerConfig } from '../types'
  */
 
 // ────────────────────────── 常量配置 ──────────────────────────
-const SIM_RESOLUTION = 128
-const DYE_RESOLUTION = 1024
+// 内部模拟分辨率现在根据输出尺寸动态缩放，以保证小分辨率输出时也有高帧率
+const SIM_RESOLUTION_BASE = 128   // 基准值，对应 1080p 输出高度
+const DYE_RESOLUTION_BASE = 1024  // 基准值，对应 1080p 输出高度
+const SIM_RESOLUTION_MIN = 64
+const DYE_RESOLUTION_MIN = 480
 
 // ────────────────────────── 着色器 ──────────────────────────
 
@@ -330,7 +333,7 @@ interface DoubleFBO {
 
 export class WebGLFluidEngine {
   // WebGL
-  private canvas: HTMLCanvasElement
+  canvas: HTMLCanvasElement | OffscreenCanvas
   private gl: WebGLRenderingContext
   private ext = {
     formatRGBA: null as { internalFormat: number; format: number } | null,
@@ -363,10 +366,13 @@ export class WebGLFluidEngine {
   private pressure!: DoubleFBO
   private bloom!: FBO
   private bloomFramebuffers: FBO[] = []
+  // 独立显示 FBO，避免依赖 canvas 默认 framebuffer（hidden canvas 在 WKWebView 中可能无后备存储）
+  private displayFBO!: FBO
 
   // Display
   private displayWidth = 0
   private displayHeight = 0
+
 
   // State
   private pendingSplats: SplatPoint[] = []
@@ -374,20 +380,21 @@ export class WebGLFluidEngine {
   private running = false
   private time = 0
   private colorUpdateTimer = 0
+  private rotatingHue = 260  // 当前旋转色相，初始 = config.hue
 
   // Config
   config: VisualizerConfig
   private fluidConfig = {
-    DENSITY_DISSIPATION: 2.5,
-    VELOCITY_DISSIPATION: 0.3,
-    PRESSURE: 0.85,
+    DENSITY_DISSIPATION: 1.5,       // 降低消散，染料更持久
+    VELOCITY_DISSIPATION: 0.2,      // 降低速度消散
+    PRESSURE: 0.9,                   // 提高压力保持
     PRESSURE_ITERATIONS: 20,
-    CURL: 28,
-    SPLAT_RADIUS: 0.18,
-    SPLAT_FORCE: 2500,
-    BLOOM_INTENSITY: 0.65,
-    BLOOM_THRESHOLD: 0.55,
-    BLOOM_SOFT_KNEE: 0.7,
+    CURL: 30,                        // 提高基础涡度
+    SPLAT_RADIUS: 0.20,              // 更大的 splat 半径
+    SPLAT_FORCE: 3500,               // 更大力道
+    BLOOM_INTENSITY: 0.75,           // 更强辉光
+    BLOOM_THRESHOLD: 0.5,            // 更低阈值 = 更多区域发光
+    BLOOM_SOFT_KNEE: 0.75,           // 更柔和过渡
   }
 
   // 缓存的音频能量，供 step() 动态调参
@@ -399,41 +406,47 @@ export class WebGLFluidEngine {
   // Quad buffer
   private quadBuffer: WebGLBuffer | null = null
 
-  constructor(canvas: HTMLCanvasElement, config: VisualizerConfig) {
+  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, config: VisualizerConfig, preserveDrawing = false) {
     this.canvas = canvas
     this.config = { ...config }
     this.applyConfig()
 
     // 尝试 WebGL2，回退到 WebGL1
-    const gl = canvas.getContext('webgl2', {
+    const ctxOpts: WebGLContextAttributes = {
       alpha: true,
       depth: false,
       stencil: false,
       antialias: false,
-      preserveDrawingBuffer: true,
-    }) as WebGLRenderingContext | null
+      preserveDrawingBuffer: preserveDrawing,
+    }
+
+    let gl: WebGLRenderingContext | null = null
+    if ('getContext' in canvas) {
+      gl = (canvas as HTMLCanvasElement).getContext('webgl2', ctxOpts) as WebGLRenderingContext | null
+    } else {
+      gl = (canvas as OffscreenCanvas).getContext('webgl2', ctxOpts) as unknown as WebGLRenderingContext | null
+    }
 
     this.isWebGL2 = !!gl
 
     if (!gl) {
-      const gl1 = canvas.getContext('webgl', {
-        alpha: true,
-        depth: false,
-        stencil: false,
-        antialias: false,
-        preserveDrawingBuffer: true,
-      })
-      if (!gl1) throw new Error('WebGL not supported')
-      this.gl = gl1
-    } else {
-      this.gl = gl
+      if ('getContext' in canvas) {
+        gl = (canvas as HTMLCanvasElement).getContext('webgl', ctxOpts)
+      } else {
+        gl = (canvas as OffscreenCanvas).getContext('webgl', ctxOpts) as unknown as WebGLRenderingContext | null
+      }
+      if (!gl) throw new Error('WebGL not supported')
     }
+    this.gl = gl
 
     this.initExtensions()
     this.initPrograms()
     this.createQuad()
-    this.initFramebuffers()
+    // 必须在 initFramebuffers 前设置好 displayWidth/Height
+    // OffscreenCanvas: canvas 已预先 sizing，直接从 canvas 读取
+    // HTMLCanvas: getBoundingClientRect 此时应已就绪（@canvas-ready 后调用）
     this.resize()
+    this.initFramebuffers()
 
     // 初始化 8 个频段位置
     for (let i = 0; i < 8; i++) {
@@ -636,9 +649,12 @@ export class WebGLFluidEngine {
     const r = this.ext.formatR!
     const filtering = this.ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST
 
-    // 计算分辨率
-    const simRes = this.getResolution(SIM_RESOLUTION)
-    const dyeRes = this.getResolution(DYE_RESOLUTION)
+    // 动态分辨率：根据输出高度缩放模拟精度，小输出 = 快渲染
+    const scale = this.displayHeight / 1080
+    const simResRaw = Math.max(SIM_RESOLUTION_MIN, Math.round(SIM_RESOLUTION_BASE * scale))
+    const dyeResRaw = Math.max(DYE_RESOLUTION_MIN, Math.round(DYE_RESOLUTION_BASE * scale))
+    const simRes = this.getResolution(simResRaw)
+    const dyeRes = this.getResolution(dyeResRaw)
 
     this.velocity = this.createDoubleFBO(simRes.width, simRes.height,
       rg.internalFormat, rg.format, texType, filtering)
@@ -652,6 +668,24 @@ export class WebGLFluidEngine {
       r.internalFormat, r.format, texType, gl.NEAREST)
 
     this.initBloomFramebuffers()
+
+    // 显示 FBO：独立于 canvas 默认 framebuffer，使用 RGBA8 确保 readPixels 可靠
+    // 避免 hidden canvas 在 WKWebView 中默认 framebuffer 无后备存储导致黑屏
+    if (this.displayFBO) {
+      gl.deleteFramebuffer(this.displayFBO.fbo)
+      gl.deleteTexture(this.displayFBO.texture)
+    }
+    this.displayFBO = this.createFBO(this.displayWidth, this.displayHeight,
+      gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST)
+    // 验证 displayFBO 完整性
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.displayFBO.fbo)
+    const fboStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+    if (fboStatus !== gl.FRAMEBUFFER_COMPLETE) {
+      console.error(`[WebGLFluid] displayFBO 不完整! status=${fboStatus}, expected=${gl.FRAMEBUFFER_COMPLETE}`)
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+
+    console.log(`[WebGLFluid] FBO 初始化: sim=${simRes.width}x${simRes.height} dye=${dyeRes.width}x${dyeRes.height} output=${this.displayWidth}x${this.displayHeight}`)
   }
 
   private initBloomFramebuffers() {
@@ -660,7 +694,8 @@ export class WebGLFluidEngine {
     const rgba = this.ext.formatRGBA!
     const filtering = this.ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST
 
-    const res = this.getResolution(256) // BLOOM_RESOLUTION
+    const bloomBase = Math.max(128, Math.round(256 * (this.displayHeight / 1080)))
+    const res = this.getResolution(bloomBase)
     this.bloom = this.createFBO(res.width, res.height,
       rgba.internalFormat, rgba.format, texType, filtering)
 
@@ -744,10 +779,10 @@ export class WebGLFluidEngine {
     const gl = this.gl
     gl.disable(gl.BLEND)
 
-    // 动态参数：音频越强 → 涡旋越强、速度消散越慢、压力迭代越多
-    const dynCurl = this.fluidConfig.CURL * (0.6 + audioEnergy * 1.4)   // 17~39
-    const dynVelDissipation = this.fluidConfig.VELOCITY_DISSIPATION * (1.5 - audioEnergy * 1.0)  // 0.15~0.45
-    const dynPressureIters = Math.round(this.fluidConfig.PRESSURE_ITERATIONS * (0.8 + audioEnergy * 0.6))  // 16~28
+    // 动态参数：音频越强 → 涡旋越强、速度消散越慢、压力迭代越多 (扩大动态范围)
+    const dynCurl = this.fluidConfig.CURL * (0.4 + audioEnergy * 2.0)
+    const dynVelDissipation = this.fluidConfig.VELOCITY_DISSIPATION * (2.0 - audioEnergy * 1.6)
+    const dynPressureIters = Math.round(this.fluidConfig.PRESSURE_ITERATIONS * (0.6 + audioEnergy * 0.9))
 
     // 1. Curl
     gl.useProgram(this.curlProgram)
@@ -908,14 +943,14 @@ export class WebGLFluidEngine {
 
   // ═══════════ 渲染显示 ═══════════
 
-  private renderDisplay() {
+  private renderDisplay(targetFbo: WebGLFramebuffer | null = null) {
     const gl = this.gl
 
     // 1. Bloom
     this.applyBloom(this.dye, this.bloom)
 
-    // 2. 先清除屏幕为黑色（Pavel 原版：先画背景色再叠流体）
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    // 2. Clear and render to target
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo)
     gl.viewport(0, 0, this.displayWidth, this.displayHeight)
     gl.clearColor(0.0, 0.0, 0.0, 1.0)
     gl.clear(gl.COLOR_BUFFER_BIT)
@@ -938,15 +973,128 @@ export class WebGLFluidEngine {
   // ═══════════ 公共接口 ═══════════
 
   resize(): void {
-    const dpr = window.devicePixelRatio || 1
-    const rect = this.canvas.getBoundingClientRect()
-    const w = Math.floor(rect.width * dpr)
-    const h = Math.floor(rect.height * dpr)
-    if (w === 0 || h === 0) return
-    this.displayWidth = w
-    this.displayHeight = h
-    this.canvas.width = w
-    this.canvas.height = h
+    // DOM canvas: use bounding rect
+    if ('getBoundingClientRect' in this.canvas) {
+      const dpr = window.devicePixelRatio || 1
+      const rect = (this.canvas as HTMLCanvasElement).getBoundingClientRect()
+      let w = Math.floor(rect.width * dpr)
+      let h = Math.floor(rect.height * dpr)
+      // 如果 canvas 不在 DOM 中，getBoundingClientRect 返回 0×0
+      // 回退到 canvas.width / canvas.height（离线渲染场景）
+      if (w === 0 || h === 0) {
+        w = this.canvas.width
+        h = this.canvas.height
+        if (w === 0 || h === 0) return
+      }
+      this.displayWidth = w
+      this.displayHeight = h
+      this.canvas.width = w
+      this.canvas.height = h
+    }
+    // OffscreenCanvas: already sized, just sync display dimensions
+    else {
+      this.displayWidth = this.canvas.width
+      this.displayHeight = this.canvas.height
+    }
+  }
+
+  /** 直接设置画布尺寸（用于离线渲染），并重建 FBO */
+  setDimensions(width: number, height: number): void {
+    const needsRebuild = this.displayWidth !== width || this.displayHeight !== height
+    this.canvas.width = width
+    this.canvas.height = height
+    this.displayWidth = width
+    this.displayHeight = height
+
+    // 仅当尺寸变化时重置捕获缓冲区
+    const size = width * height * 4
+    if (!this._captureBuf || this._captureBuf.length !== size) {
+      this._captureBuf = new Uint8Array(size)
+    }
+
+    // 重建 FBO 以匹配新尺寸
+    if (needsRebuild) {
+      this.initFramebuffers()
+    }
+  }
+
+  // 使用 drawImage 从 WebGL canvas 复制到 2D canvas，避免 readPixels 兼容性问题
+  private _captureBuf: Uint8Array | null = null
+
+  /** Capture RGBA pixels from displayFBO via readPixels (standard WebGL approach) */
+  captureFrame(): Uint8Array {
+    const gl = this.gl
+    const w = this.displayWidth
+    const h = this.displayHeight
+    const size = w * h * 4
+
+    if (!this._captureBuf || this._captureBuf.length !== size) {
+      this._captureBuf = new Uint8Array(size)
+    }
+
+    // Ensure all GL commands complete
+    gl.finish()
+
+    // Read from displayFBO (RGBA8, always has GPU backing unlike default FB)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.displayFBO.fbo)
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, this._captureBuf)
+
+    return this._captureBuf
+  }
+
+  resetState(): void {
+    this.time = 0
+    this.currentAudioEnergy = 0
+    this.colorUpdateTimer = 0
+    this.rotatingHue = this.config.hue
+    this.pendingSplats = []
+    this.bandPositions = []
+    for (let i = 0; i < 8; i++) {
+      this.bandPositions.push({
+        x: Math.random(),
+        y: Math.random(),
+        color: this.generateColor(),
+      })
+    }
+  }
+
+  /**
+   * 离线渲染一帧：注入音频 splats → 模拟步进 → 渲染显示
+   * 调用后可用 captureFrame() 获取像素
+   */
+  offlineStep(dt: number, spectrum: SpectrumData | null, beat: BeatResult): void {
+    // 动态色相旋转
+    if (this.config.hueRotate) {
+      const speed = this.config.hueRotateSpeed ?? 1.0
+      this.rotatingHue = ((this.rotatingHue + dt * speed * 30) % 360 + 360) % 360
+    } else {
+      this.rotatingHue = this.config.hue
+    }
+
+    this.updateColors(dt)
+
+    // 音频驱动的染料注入
+    if (spectrum) {
+      this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * 0.15
+      this.generateAudioSplats(spectrum, beat, dt)
+    } else {
+      this.currentAudioEnergy *= 0.9
+    }
+
+    // 应用排队的 splats
+    for (const s of this.pendingSplats) {
+      this.splat(s.x, s.y, s.dx, s.dy, s.color)
+    }
+    this.pendingSplats = []
+
+    // 模拟步进
+    this.step(dt, this.currentAudioEnergy)
+
+    // Render to canvas default FB + displayFBO
+    if (this.displayWidth > 0 && this.displayHeight > 0) {
+      this.renderDisplay(null)
+      this.renderDisplay(this.displayFBO.fbo)
+    }
   }
 
   start(
@@ -983,6 +1131,14 @@ export class WebGLFluidEngine {
         this.currentAudioEnergy *= 0.9
       }
 
+      // 动态色相旋转
+      if (this.config.hueRotate) {
+        const speed = this.config.hueRotateSpeed ?? 1.0
+        this.rotatingHue = ((this.rotatingHue + dt * speed * 30) % 360 + 360) % 360
+      } else {
+        this.rotatingHue = this.config.hue
+      }
+
       // 颜色变换
       this.updateColors(dt)
 
@@ -1001,7 +1157,7 @@ export class WebGLFluidEngine {
       this.step(dt, this.currentAudioEnergy)
 
       if (this.displayWidth > 0 && this.displayHeight > 0) {
-        this.renderDisplay()
+        this.renderDisplay(null)
       } else {
         this.resize()
       }
@@ -1017,6 +1173,28 @@ export class WebGLFluidEngine {
     cancelAnimationFrame(this.animFrameId)
   }
 
+  /** 释放 WebGL 上下文和相关 GPU 资源 */
+  destroy(): void {
+    this.stop()
+    const gl = this.gl
+    // 删除所有 shader programs
+    const programs = [
+      this.clearProgram, this.splatProgram, this.advectionProgram,
+      this.divergenceProgram, this.curlProgram, this.vorticityProgram,
+      this.pressureProgram, this.gradientSubtractProgram,
+      this.bloomPrefilterProgram, this.bloomBlurProgram, this.bloomFinalProgram,
+      this.displayProgram,
+    ]
+    for (const p of programs) {
+      if (p) gl.deleteProgram(p)
+    }
+    // 使用 WEBGL_lose_context 扩展释放上下文
+    const loseExt = gl.getExtension('WEBGL_lose_context')
+    if (loseExt) {
+      loseExt.loseContext()
+    }
+  }
+
   // ═══════════ 配置更新 ═══════════
 
   /** 从外部 UI 面板同步配置变更 */
@@ -1028,13 +1206,13 @@ export class WebGLFluidEngine {
   /** 将 VisualizerConfig 映射到流体物理参数 */
   private applyConfig(): void {
     const c = this.config
-    // glowIntensity 0~2 → bloom 0.3~1.3
-    this.fluidConfig.BLOOM_INTENSITY = 0.3 + c.glowIntensity * 0.5
-    // shakeIntensity 0~2 → curl 10~50, velocity dissipation 0.5~0.1
-    this.fluidConfig.CURL = 10 + c.shakeIntensity * 20
-    this.fluidConfig.VELOCITY_DISSIPATION = 0.5 - c.shakeIntensity * 0.2
+    // glowIntensity 0~2 → bloom 0.4~1.4
+    this.fluidConfig.BLOOM_INTENSITY = 0.4 + c.glowIntensity * 0.5
+    // shakeIntensity 0~2 → curl 15~60, velocity dissipation 0.35~0.05
+    this.fluidConfig.CURL = 15 + c.shakeIntensity * 22.5
+    this.fluidConfig.VELOCITY_DISSIPATION = 0.35 - c.shakeIntensity * 0.15
     // shakeIntensity also affects force
-    this.fluidConfig.SPLAT_FORCE = 1500 + c.shakeIntensity * 1500
+    this.fluidConfig.SPLAT_FORCE = 2500 + c.shakeIntensity * 2000
   }
 
   // 手动触发随机 splat（空格键等）
@@ -1066,9 +1244,10 @@ export class WebGLFluidEngine {
   }
 
   private generateColor(): [number, number, number] {
-    // 在 baseHue ±25° 范围内随机生成
-    const baseHue = this.config.hue
-    const h = ((baseHue + (Math.random() - 0.5) * 50) / 360 + 1) % 1
+    // 在 rotatingHue ± (hueSpread/2) 范围内随机生成
+    const baseHue = this.rotatingHue
+    const spread = this.config.hueSpread ?? 50
+    const h = ((baseHue + (Math.random() - 0.5) * spread) / 360 + 1) % 1
     const c = this.hsvToRgb(h, 1.0, 1.0)
     return [c[0] * 0.15, c[1] * 0.15, c[2] * 0.15]
   }
@@ -1096,12 +1275,33 @@ export class WebGLFluidEngine {
   private generateAudioSplats(spectrum: SpectrumData, beat: BeatResult, dt: number) {
     const freq = spectrum.frequency
     const bandCount = 8
-    const ENERGY_THRESHOLD = 0.04  // 降低阈值，更多频段参与
+    const intensityMul = this.config.fluidIntensity ?? 1.0
+    const activityMul = this.config.fluidActivity ?? 1.0
+    // 活跃度越低 → 阈值越高，避免低能量时也满屏
 
     // 整体平均能量，用于控制动态级别
     let totalEnergy = 0
     for (let i = 0; i < freq.length; i++) totalEnergy += freq[i]
     const avgEnergy = totalEnergy / (freq.length * 255)
+
+    // ═══ 全局能量层：全屏底色随能量涨落 ═══
+    if (avgEnergy > 0.04) {
+      const globalSpread = Math.ceil(avgEnergy * 5 * activityMul)
+      for (let i = 0; i < globalSpread; i++) {
+        const gColor = this.generateColor()
+        const gBright = (0.04 + avgEnergy * 0.6) * intensityMul
+        gColor[0] *= gBright
+        gColor[1] *= gBright
+        gColor[2] *= gBright
+        this.pendingSplats.push({
+          x: 0.1 + Math.random() * 0.8,
+          y: 0.1 + Math.random() * 0.8,
+          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.4,
+          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.4,
+          color: gColor,
+        })
+      }
+    }
 
     for (let b = 0; b < bandCount; b++) {
       const binStart = Math.floor((freq.length / bandCount) * b)
@@ -1110,56 +1310,48 @@ export class WebGLFluidEngine {
       for (let i = binStart; i < binEnd; i++) bandSum += freq[i]
       const bandEnergy = bandSum / ((binEnd - binStart) * 255)
 
-      if (bandEnergy < ENERGY_THRESHOLD) continue
+      if (bandEnergy < 0.008) continue
 
       const bp = this.bandPositions[b]
       const color = bp.color
 
-      // 更大范围的随机游走，让位置更多变
-      const wanderSpeed = dt * (0.5 + bandEnergy * 3.0)
+      const wanderSpeed = dt * (0.6 + bandEnergy * 4.0)
       bp.x += (Math.random() - 0.5) * wanderSpeed
       bp.y += (Math.random() - 0.5) * wanderSpeed
 
-      // 偶尔大幅跳跃
-      if (Math.random() < bandEnergy * 0.3) {
-        bp.x += (Math.random() - 0.5) * 0.3
-        bp.y += (Math.random() - 0.5) * 0.3
+      if (Math.random() < bandEnergy * 0.4) {
+        bp.x += (Math.random() - 0.5) * 0.4
+        bp.y += (Math.random() - 0.5) * 0.4
       }
 
       bp.x = Math.max(0.03, Math.min(0.97, bp.x))
       bp.y = Math.max(0.03, Math.min(0.97, bp.y))
 
-      // 增加 splat 数量
-      const count = Math.ceil(bandEnergy * 3.0)
+      const count = Math.ceil(bandEnergy * 5.0 * activityMul)
       for (let j = 0; j < count; j++) {
-        // 更大的散布半径
-        const sx = bp.x + (Math.random() - 0.5) * (0.2 + bandEnergy * 0.3)
-        const sy = bp.y + (Math.random() - 0.5) * (0.2 + bandEnergy * 0.3)
+        const sx = bp.x + (Math.random() - 0.5) * (0.25 + bandEnergy * 0.4)
+        const sy = bp.y + (Math.random() - 0.5) * (0.25 + bandEnergy * 0.4)
 
-        // 多样化的速度方向
         const r = Math.random()
         let dx: number, dy: number
         if (r < 0.4) {
-          // 螺旋
           const phase = this.time * 2.5 + b * 0.7
           const angle = phase + (Math.random() - 0.5) * 2.0
-          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 1.5
           dx = Math.cos(angle) * fm
           dy = Math.sin(angle) * fm
         } else if (r < 0.7) {
-          // 径向（从频段中心向外）
           const angle = Math.random() * Math.PI * 2
-          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 0.8
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 1.2
           dx = Math.cos(angle) * fm
           dy = Math.sin(angle) * fm
         } else {
-          // 随机方向
-          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 1.2
+          const fm = this.fluidConfig.SPLAT_FORCE * bandEnergy * 1.8
           dx = (Math.random() - 0.5) * fm * 2
           dy = (Math.random() - 0.5) * fm * 2
         }
 
-        const brightness = 0.15 + bandEnergy * 1.5
+        const brightness = (0.25 + bandEnergy * 2.5) * intensityMul
         const boostedColor: [number, number, number] = [
           color[0] * brightness,
           color[1] * brightness,
@@ -1175,17 +1367,17 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 全局随机散布：在无特定频段关联的位置随机注入
-    if (avgEnergy > 0.06) {
-      const scatterCount = Math.ceil(avgEnergy * 6)
+    // 全局随机散布
+    if (avgEnergy > 0.05) {
+      const scatterCount = Math.ceil(avgEnergy * 10 * activityMul)
       for (let i = 0; i < scatterCount; i++) {
         const color = this.generateColor()
-        const brightness = 0.08 + avgEnergy * 0.8
+        const brightness = (0.12 + avgEnergy * 1.2) * intensityMul
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const fm = this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.5
+        const fm = this.fluidConfig.SPLAT_FORCE * avgEnergy * 1.0
         this.pendingSplats.push({
           x: Math.random(),
           y: Math.random(),
@@ -1196,36 +1388,35 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 节拍爆发 — 更鲜明
+    // 节拍爆发
     if (beat.isBeat && beat.intensity > 0.2) {
-      const burstCount = 8 + Math.floor(beat.intensity * 15)
+      const burstCount = Math.ceil((12 + beat.intensity * 25) * activityMul)
       for (let i = 0; i < burstCount; i++) {
         const color = this.generateColor()
-        const brightness = 0.3 + beat.intensity * 2.5
+        const brightness = (0.5 + beat.intensity * 3.5) * intensityMul
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.0
+        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.8
         this.pendingSplats.push({
-          x: 0.15 + Math.random() * 0.7,
-          y: 0.15 + Math.random() * 0.7,
+          x: 0.1 + Math.random() * 0.8,
+          y: 0.1 + Math.random() * 0.8,
           dx: Math.cos(angle) * speed,
           dy: Math.sin(angle) * speed,
           color,
         })
       }
 
-      // 额外：中心辐射状爆发
-      const radialCount = Math.floor(beat.intensity * 8)
+      const radialCount = Math.ceil(beat.intensity * 12 * activityMul)
       for (let i = 0; i < radialCount; i++) {
         const color = this.generateColor()
-        color[0] *= beat.intensity * 2
-        color[1] *= beat.intensity * 2
-        color[2] *= beat.intensity * 2
+        color[0] *= beat.intensity * 3 * intensityMul
+        color[1] *= beat.intensity * 3 * intensityMul
+        color[2] *= beat.intensity * 3 * intensityMul
         const a = (i / radialCount) * Math.PI * 2
-        const r = 0.05 + Math.random() * 0.15
-        const spd = this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.8
+        const r = 0.03 + Math.random() * 0.12
+        const spd = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.5
         this.pendingSplats.push({
           x: 0.5 + Math.cos(a) * r,
           y: 0.5 + Math.sin(a) * r,

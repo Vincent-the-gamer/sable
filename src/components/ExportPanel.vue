@@ -24,6 +24,7 @@ interface ResolutionPreset {
 }
 
 const resolutionPresets: ResolutionPreset[] = [
+    { label: "480p", width: 640, height: 480 },
     { label: "720p", width: 1280, height: 720 },
     { label: "1080p", width: 1920, height: 1080 },
     { label: "2K", width: 2560, height: 1440 },
@@ -85,12 +86,16 @@ function onCrfInput(e: Event) {
 
 // ═══ Width/Height input ═══
 function onWidthInput(e: Event) {
-    local.value.width = Number((e.target as HTMLInputElement).value);
+    let w = Number((e.target as HTMLInputElement).value);
+    if (w % 2 !== 0) w = Math.ceil(w / 2) * 2;
+    local.value.width = w;
     emitChange();
 }
 
 function onHeightInput(e: Event) {
-    local.value.height = Number((e.target as HTMLInputElement).value);
+    let h = Number((e.target as HTMLInputElement).value);
+    if (h % 2 !== 0) h = Math.ceil(h / 2) * 2;
+    local.value.height = h;
     emitChange();
 }
 
@@ -99,8 +104,10 @@ function resetDefaults() {
         width: 1920,
         height: 1080,
         fps: 30,
+        encoder: "videotoolbox_h264",
         format: "mp4",
         crf: 23,
+        speedPreset: "ultrafast",
     };
     emitChange();
 }

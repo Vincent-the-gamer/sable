@@ -155,6 +155,54 @@ export const DEFAULT_SUBTITLE_CONFIG: SubtitleConfig = {
   exitEffect: ['fade'],
 }
 
+/** 频谱可视化样式 */
+export type SpectrumStyle = 'bars' | 'circular' | 'wave' | 'mirror' | 'dots'
+
+export const SPECTRUM_STYLE_OPTIONS: { label: string; value: SpectrumStyle }[] = [
+  { label: '柱状', value: 'bars' },
+  { label: '环形', value: 'circular' },
+  { label: '波形', value: 'wave' },
+  { label: '镜像', value: 'mirror' },
+  { label: '星点', value: 'dots' },
+]
+
+/** 频谱可视化配置 */
+export interface SpectrumConfig {
+  /** 是否启用 */
+  enabled: boolean
+  /** 样式 */
+  style: SpectrumStyle
+  /** 不透明度 (0-1) */
+  opacity: number
+  /** 颜色模式: 'hue' 跟随流体色相, 'auto' 频段渐变, 'custom' 自定义 */
+  colorMode: 'hue' | 'auto' | 'custom'
+  /** 自定义颜色 (CSS) */
+  customColor: string
+  /** 柱数/点数 */
+  barCount: number
+  /** 灵敏度 (0-1)，值越大低能量响应越强 */
+  sensitivity: number
+  /** 跟随的色相 (由流体配置同步) */
+  hue: number
+  /** 色相是否自动旋转 */
+  hueRotate: boolean
+  /** 旋转速度 */
+  hueRotateSpeed: number
+}
+
+export const DEFAULT_SPECTRUM_CONFIG: SpectrumConfig = {
+  enabled: false,
+  style: 'bars',
+  opacity: 0.85,
+  colorMode: 'hue',
+  customColor: '#a855f7',
+  barCount: 64,
+  sensitivity: 0.5,
+  hue: 260,
+  hueRotate: false,
+  hueRotateSpeed: 1.0,
+}
+
 /** 可视化配置 */
 export interface VisualizerConfig {
   /** 粒子最大数量 */
@@ -163,9 +211,45 @@ export interface VisualizerConfig {
   glowIntensity: number
   /** 抖动/涡度强度系数 */
   shakeIntensity: number
-  /** 色相 (0-360)，引擎在此值 ±25° 范围内随机生成颜色 */
+  /** 色相中心 (0-360)，颜色在此值附近随机生成 */
   hue: number
+  /** 色相扩散范围 (0-180)，实际色相在 [hue-spread/2, hue+spread/2] 内 */
+  hueSpread: number
+  /** 流体亮度/力道倍率 (0.1-2.0)，控制注入染料的鲜艳度 */
+  fluidIntensity: number
+  /** 流体活跃度倍率 (0.1-2.0)，控制注入点的密度 */
+  fluidActivity: number
+  /** 色相是否自动旋转渐变 */
+  hueRotate: boolean
+  /** 色相旋转速度 (0.1-5.0)，值越大越快 */
+  hueRotateSpeed: number
+  /** 边缘鼓点闪烁：是否启用 */
+  beatEdgeEnabled: boolean
+  /** 边缘鼓点闪烁：灵敏度 (0.5-2.0)，值越大越容易触发 */
+  beatEdgeSensitivity: number
 }
+
+/** 编码器选项 */
+export type VideoEncoder = 'videotoolbox_h264' | 'videotoolbox_hevc' | 'software_x264' | 'software_x265' | 'software_vp9'
+
+export const ENCODER_OPTIONS: { value: VideoEncoder; label: string; desc: string }[] = [
+  { value: 'videotoolbox_h264', label: 'VideoToolbox H.264', desc: '硬件加速 • 极速 • 兼容好' },
+  { value: 'videotoolbox_hevc', label: 'VideoToolbox HEVC', desc: '硬件加速 • 体积更小' },
+  { value: 'software_x264',  label: 'x264 (H.264)',      desc: '软编 • 兼容性最佳' },
+  { value: 'software_x265',  label: 'x265 (HEVC)',       desc: '软编 • 压缩率最高' },
+  { value: 'software_vp9',   label: 'VP9 (WebM)',        desc: '开放格式' },
+]
+
+/** 编码速度预设 */
+export type SpeedPreset = 'ultrafast' | 'superfast' | 'fast' | 'balanced' | 'quality'
+
+export const SPEED_PRESET_OPTIONS: { label: string; value: SpeedPreset; desc: string }[] = [
+  { label: '⚡ 极速', value: 'ultrafast', desc: '速度最快，文件较大' },
+  { label: '🏃 超快', value: 'superfast', desc: '速度快，质量尚可' },
+  { label: '🚀 快速', value: 'fast', desc: '速度与质量兼顾' },
+  { label: '⚖️ 均衡', value: 'balanced', desc: '推荐日常使用' },
+  { label: '💎 高品质', value: 'quality', desc: '体积最小，速度较慢' },
+]
 
 /** 导出设置 */
 export interface ExportSettings {
@@ -175,8 +259,12 @@ export interface ExportSettings {
   height: number
   /** 帧率 */
   fps: number
+  /** 编码器 */
+  encoder: VideoEncoder
   /** 输出格式 */
   format: 'mp4' | 'webm'
-  /** CRF 质量 (0-51, 越小质量越高) */
+  /** CRF 质量 (0-51, 越小质量越高, 仅软件编码器) */
   crf: number
+  /** 编码速度预设 (仅软件编码器) */
+  speedPreset: SpeedPreset
 }

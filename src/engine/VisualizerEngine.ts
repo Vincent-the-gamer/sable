@@ -23,6 +23,13 @@ export class VisualizerEngine {
     glowIntensity: 1.0,
     shakeIntensity: 1.0,
     hue: 260,
+    hueSpread: 50,
+    fluidIntensity: 1.0,
+    fluidActivity: 1.0,
+    hueRotate: false,
+    hueRotateSpeed: 1.0,
+    beatEdgeEnabled: true,
+    beatEdgeSensitivity: 1.0,
   }
 
   constructor(canvas: HTMLCanvasElement) {

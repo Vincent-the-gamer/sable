@@ -45,6 +45,10 @@ export class OfflineRenderer {
     this.particles = []
     this.shakeX = 0
     this.shakeY = 0
+    this.energyHistory = []
+    this.cooldownCounter = 0
+    this.lastIntensity = 0
+    this.prevFluxSpectrum = null
   }
 
   /**
@@ -132,14 +136,34 @@ export class OfflineRenderer {
     return { frequency: freqData, waveform: waveData, averageEnergy, bassEnergy }
   }
 
-  // ========== 节拍检测（简化版） ==========
+  // ========== 节拍检测（频谱通量增强版） ==========
   private energyHistory: number[] = []
   private cooldownCounter = 0
   private lastIntensity = 0
+  private prevFluxSpectrum: number[] | null = null
 
   private detectBeat(spectrum: ReturnType<OfflineRenderer['computeSpectrum']>) {
-    const bassEnergy = spectrum.bassEnergy
-    this.energyHistory.push(bassEnergy)
+    // sub-bass 能量 (bin 0-1 ≈ 0-344 Hz @ 256 FFT)
+    const subBassBins = Math.min(2, spectrum.frequency.length)
+    let subBassSum = 0
+    for (let i = 0; i < subBassBins; i++) subBassSum += spectrum.frequency[i]
+    const subBassEnergy = subBassSum / (subBassBins * 255)
+
+    // 频谱通量
+    let spectralFlux = 0
+    if (this.prevFluxSpectrum && this.prevFluxSpectrum.length === spectrum.frequency.length) {
+      let fluxSum = 0
+      for (let i = 0; i < spectrum.frequency.length; i++) {
+        const diff = spectrum.frequency[i] - this.prevFluxSpectrum[i]
+        if (diff > 0) fluxSum += diff
+      }
+      spectralFlux = fluxSum / (spectrum.frequency.length * 255)
+    }
+    this.prevFluxSpectrum = Array.from(spectrum.frequency)
+
+    const combinedEnergy = subBassEnergy * 0.6 + spectrum.averageEnergy * 0.4
+
+    this.energyHistory.push(combinedEnergy)
     if (this.energyHistory.length > 60) this.energyHistory.shift()
     if (this.cooldownCounter > 0) this.cooldownCounter--
 
@@ -147,16 +171,21 @@ export class OfflineRenderer {
     const isBeat =
       this.cooldownCounter === 0 &&
       this.energyHistory.length >= 10 &&
-      bassEnergy > avg * 1.4 &&
-      bassEnergy > 0.15
+      combinedEnergy > avg * 1.35 &&
+      combinedEnergy > 0.12 &&
+      (subBassEnergy > 0.08 || spectralFlux > 0.06)
 
     if (isBeat) {
-      this.cooldownCounter = 12
-      this.lastIntensity = Math.min(1, (bassEnergy - avg * 1.4) / (1 - avg * 1.4))
+      this.cooldownCounter = 10
+      const energyStrength = Math.min(1, (combinedEnergy - avg * 1.35) / (1 - avg * 1.35))
+      const fluxStrength = Math.min(1, spectralFlux * 5)
+      this.lastIntensity = Math.min(1, Math.max(0.15,
+        energyStrength * 0.6 + fluxStrength * 0.4
+      ))
       return { isBeat: true, intensity: this.lastIntensity }
     }
 
-    this.lastIntensity *= 0.9
+    this.lastIntensity *= 0.88
     return { isBeat: false, intensity: this.lastIntensity }
   }
 

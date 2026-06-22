@@ -17,8 +17,18 @@ import type {
     SubtitleConfig,
     LyricLine,
     BeatResult,
+    SpectrumConfig,
+    SpeedPreset,
+    VideoEncoder,
 } from "../types";
-import { ENTRANCE_EFFECT_OPTIONS, EXIT_EFFECT_OPTIONS } from "../types";
+import {
+    ENTRANCE_EFFECT_OPTIONS,
+    EXIT_EFFECT_OPTIONS,
+    SPECTRUM_STYLE_OPTIONS,
+    DEFAULT_SPECTRUM_CONFIG,
+    SPEED_PRESET_OPTIONS,
+    ENCODER_OPTIONS,
+} from "../types";
 import type { EntranceEffect, ExitEffect } from "../types";
 import type { ExportProgress } from "../engine/ExportPipeline";
 
@@ -40,17 +50,20 @@ const props = defineProps<{
     hasLyrics: boolean;
     subtitleConfig: SubtitleConfig;
     latestBeat: BeatResult;
+    spectrumConfig: SpectrumConfig;
 }>();
 
 const emit = defineEmits<{
     (e: "update:config", config: VisualizerConfig): void;
     (e: "update:exportSettings", settings: ExportSettings): void;
     (e: "update:subtitleConfig", config: SubtitleConfig): void;
+    (e: "update:spectrumConfig", config: SpectrumConfig): void;
     (e: "lrcImport"): void;
     (e: "play"): void;
     (e: "pause"): void;
     (e: "seek", time: number): void;
     (e: "canvasReady", canvas: HTMLCanvasElement): void;
+    (e: "spectrumCanvasReady", canvas: HTMLCanvasElement): void;
     (e: "selectOutputPath"): void;
     (e: "startExport"): void;
     (e: "cancelExport"): void;
@@ -77,6 +90,36 @@ const hueValue = computed({
     get: () => props.config.hue,
     set: (v) => emitConfig({ hue: v }),
 });
+const hueSpread = computed({
+    get: () => props.config.hueSpread ?? 60,
+    set: (v) => emitConfig({ hueSpread: v }),
+});
+const fluidIntensity = computed({
+    get: () => props.config.fluidIntensity ?? 1.0,
+    set: (v) => emitConfig({ fluidIntensity: v }),
+});
+const fluidActivity = computed({
+    get: () => props.config.fluidActivity ?? 1.0,
+    set: (v) => emitConfig({ fluidActivity: v }),
+});
+const hueRotate = computed({
+    get: () => props.config.hueRotate ?? false,
+    set: (v) => emitConfig({ hueRotate: v }),
+});
+const hueRotateSpeed = computed({
+    get: () => props.config.hueRotateSpeed ?? 1.0,
+    set: (v) => emitConfig({ hueRotateSpeed: v }),
+});
+
+// ═══ Beat Edge controls ═══
+const beatEdgeEnabled = computed({
+    get: () => props.config.beatEdgeEnabled ?? true,
+    set: (v) => emitConfig({ beatEdgeEnabled: v }),
+});
+const beatEdgeSensitivity = computed({
+    get: () => props.config.beatEdgeSensitivity ?? 1.0,
+    set: (v) => emitConfig({ beatEdgeSensitivity: v }),
+});
 
 function emitConfig(partial: Partial<VisualizerConfig>) {
     emit("update:config", { ...props.config, ...partial });
@@ -101,8 +144,55 @@ function resetConfig() {
         glowIntensity: 1.0,
         shakeIntensity: 1.0,
         hue: 260,
+        hueSpread: 60,
+        fluidIntensity: 1.0,
+        fluidActivity: 1.0,
+        hueRotate: false,
+        hueRotateSpeed: 1.0,
+        beatEdgeEnabled: true,
+        beatEdgeSensitivity: 1.0,
     });
 }
+
+// ═══ Spectrum controls ═══
+const spectrumEnabled = computed({
+    get: () => props.spectrumConfig.enabled,
+    set: (v) => emitSpectrumConfig({ enabled: v }),
+});
+const spectrumStyle = computed({
+    get: () => props.spectrumConfig.style,
+    set: (v) => emitSpectrumConfig({ style: v }),
+});
+const spectrumOpacity = computed({
+    get: () => props.spectrumConfig.opacity,
+    set: (v) => emitSpectrumConfig({ opacity: v }),
+});
+const spectrumColorMode = computed({
+    get: () => props.spectrumConfig.colorMode,
+    set: (v) => emitSpectrumConfig({ colorMode: v }),
+});
+const spectrumCustomColor = computed({
+    get: () => props.spectrumConfig.customColor,
+    set: (v) => emitSpectrumConfig({ customColor: v }),
+});
+const spectrumBarCount = computed({
+    get: () => props.spectrumConfig.barCount,
+    set: (v) => emitSpectrumConfig({ barCount: v }),
+});
+const spectrumSensitivity = computed({
+    get: () => props.spectrumConfig.sensitivity,
+    set: (v) => emitSpectrumConfig({ sensitivity: v }),
+});
+
+function emitSpectrumConfig(partial: Partial<SpectrumConfig>) {
+    emit("update:spectrumConfig", { ...props.spectrumConfig, ...partial });
+}
+
+function resetSpectrumConfig() {
+    emit("update:spectrumConfig", { ...DEFAULT_SPECTRUM_CONFIG });
+}
+
+const spectrumCanvasRef = ref<HTMLCanvasElement | null>(null);
 
 // ═══ Export controls ═══
 const localExport = ref<ExportSettings>({ ...props.exportSettings });
@@ -120,6 +210,7 @@ function emitExportChange() {
 }
 
 const resolutionPresets: { label: string; width: number; height: number }[] = [
+    { label: "480p", width: 640, height: 480 },
     { label: "720p", width: 1280, height: 720 },
     { label: "1080p", width: 1920, height: 1080 },
     { label: "1440p", width: 2560, height: 1440 },
@@ -140,22 +231,49 @@ function setFps(fps: number) {
     emitExportChange();
 }
 
-const formatOptions = [
-    { value: "mp4" as const, label: "MP4 (H.264)", desc: "兼容性最好" },
-    { value: "webm" as const, label: "WebM (VP9)", desc: "体积更小" },
-];
-
-function setFormat(format: "mp4" | "webm") {
-    localExport.value.format = format;
-    if (format === "webm" && localExport.value.crf < 20)
-        localExport.value.crf = 30;
-    else if (format === "mp4" && localExport.value.crf > 40)
-        localExport.value.crf = 23;
+function setSpeedPreset(preset: SpeedPreset) {
+    localExport.value.speedPreset = preset;
     emitExportChange();
 }
 
+function setEncoder(encoder: VideoEncoder) {
+    localExport.value.encoder = encoder;
+    if (encoder === "software_vp9") {
+        localExport.value.format = "webm";
+        if (localExport.value.crf < 15) localExport.value.crf = 30;
+    } else if (encoder === "software_x265") {
+        localExport.value.format = "mp4";
+        // x265 默认 CRF=28 等价于 x264 CRF=23
+        if (localExport.value.crf > 40) localExport.value.crf = 28;
+    } else {
+        localExport.value.format = "mp4";
+        if (localExport.value.crf > 40) localExport.value.crf = 23;
+    }
+    emitExportChange();
+}
+
+const isHardwareEncoder = computed(() =>
+    localExport.value.encoder.startsWith("videotoolbox"),
+);
+
 const qualityLabel = computed(() => {
+    if (isHardwareEncoder.value) {
+        const q = localExport.value.speedPreset;
+        if (q === "quality") return "极佳";
+        if (q === "balanced") return "高";
+        if (q === "fast") return "标准";
+        if (q === "superfast") return "快速";
+        return "极速";
+    }
     const c = localExport.value.crf;
+    // x265 CRF 28 ≈ x264 CRF 23
+    if (localExport.value.encoder === "software_x265") {
+        if (c <= 22) return "极佳";
+        if (c <= 28) return "高";
+        if (c <= 34) return "标准";
+        if (c <= 42) return "低";
+        return "最低";
+    }
     if (c <= 18) return "极佳";
     if (c <= 23) return "高";
     if (c <= 28) return "标准";
@@ -205,6 +323,7 @@ const animState = reactive({
     entrancePhase: 0,
     swayX: 0,
     swayY: 0,
+    beatGlowEnergy: 0,
 });
 
 let prevLyric = "";
@@ -294,6 +413,24 @@ function doBeatEffect() {
 }
 
 function tickAnimation() {
+    // 节拍边框辉光：鼓点触发时瞬间闪亮，然后快速衰减（模仿打击乐包络）
+    if (props.config.beatEdgeEnabled !== false) {
+        if (props.latestBeat?.isBeat && props.latestBeat.intensity > 0.05) {
+            // 鼓点瞬间：直接拉到检测强度（叠加一点当前残留增强连续性）
+            const target = props.latestBeat.intensity;
+            animState.beatGlowEnergy = Math.max(
+                target,
+                animState.beatGlowEnergy * 0.15 + target * 0.85,
+            );
+        }
+        // 衰减：0.84 倍率 ≈ 15 帧 (250ms) 后降到峰值的 ~7%
+        // 比之前 0.88 更快衰减，让闪动精准对齐鼓点节奏
+        animState.beatGlowEnergy *= 0.84;
+        if (animState.beatGlowEnergy < 0.003) animState.beatGlowEnergy = 0;
+    } else {
+        animState.beatGlowEnergy = 0;
+    }
+
     const ds = props.subtitleConfig.driftSpeed * 0.05;
     animState.posX += (animState.targetX - animState.posX) * ds;
     animState.posY += (animState.targetY - animState.posY) * ds;
@@ -330,6 +467,10 @@ function tickAnimation() {
         0.7;
 
     animFrameId = requestAnimationFrame(tickAnimation);
+
+    // 同步 beat edge canvas 尺寸并绘制边缘辉光
+    syncBeatEdgeCanvas();
+    renderBeatEdgeGlow();
 }
 
 // Watch for lyric changes to randomize position
@@ -485,14 +626,104 @@ function stopAnimLoop() {
 
 // ═══ Canvas init ═══
 const visCanvasRef = ref<InstanceType<typeof VisualizerCanvas> | null>(null);
+const beatEdgeCanvasRef = ref<HTMLCanvasElement | null>(null);
+let beatEdgeCtx: CanvasRenderingContext2D | null = null;
+
+/** 在 beat edge canvas 上绘制边缘鼓点辉光（内框，导出可见） */
+function renderBeatEdgeGlow() {
+    if (!beatEdgeCtx) return;
+    const ctx = beatEdgeCtx;
+    const canvas = ctx.canvas;
+    const w = canvas.width;
+    const h = canvas.height;
+
+    // 先清空
+    ctx.clearRect(0, 0, w, h);
+
+    const energy = animState.beatGlowEnergy;
+    if (energy < 0.005) return;
+
+    const hue = props.config.hue;
+    // easeOutExpo 映射
+    const eased = energy < 0.08 ? energy * 0.2 : 1 - Math.pow(1 - energy, 3);
+    const alpha = Math.min(1, eased * 1.3);
+
+    // 辉光带宽度（从边缘向内延伸的像素数，相对于画布尺寸）
+    const maxGlowWidth = Math.min(w, h) * 0.18;
+    const glowWidth = maxGlowWidth * eased;
+
+    ctx.save();
+
+    // 四个方向的渐变带
+    const edges = [
+        // 上边
+        { x: 0, y: 0, w: w, h: glowWidth },
+        // 下边
+        { x: 0, y: h - glowWidth, w: w, h: glowWidth },
+        // 左边
+        { x: 0, y: 0, w: glowWidth, h: h },
+        // 右边
+        { x: w - glowWidth, y: 0, w: glowWidth, h: h },
+    ];
+
+    for (const edge of edges) {
+        const isVertical = edge.w < edge.h;
+        const grad = isVertical
+            ? ctx.createLinearGradient(
+                  edge.x === 0 ? 0 : w,
+                  0,
+                  edge.x === 0 ? glowWidth : w - glowWidth,
+                  0,
+              )
+            : ctx.createLinearGradient(
+                  0,
+                  edge.y === 0 ? 0 : h,
+                  0,
+                  edge.y === 0 ? glowWidth : h - glowWidth,
+              );
+
+        // 多层颜色叠加
+        grad.addColorStop(0, `hsla(${hue}, 100%, 80%, ${alpha})`);
+        grad.addColorStop(0.15, `hsla(${hue}, 100%, 65%, ${alpha * 0.85})`);
+        grad.addColorStop(0.4, `hsla(${hue}, 90%, 50%, ${alpha * 0.5})`);
+        grad.addColorStop(0.7, `hsla(${hue}, 80%, 40%, ${alpha * 0.15})`);
+        grad.addColorStop(1, "transparent");
+
+        ctx.fillStyle = grad;
+        ctx.fillRect(edge.x, edge.y, edge.w, edge.h);
+    }
+
+    ctx.restore();
+}
+
+/** 初始化/更新 beat edge canvas 尺寸 */
+function syncBeatEdgeCanvas() {
+    const canvas = beatEdgeCanvasRef.value;
+    if (!canvas) return;
+    const parent = canvas.parentElement;
+    if (!parent) return;
+    const rect = parent.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.floor(rect.width * dpr);
+    const h = Math.floor(rect.height * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        beatEdgeCtx = canvas.getContext("2d");
+    }
+}
 
 onMounted(() => {
     loadSystemFonts();
     startAnimLoop();
     nextTick(() => {
         setupResizeObserver();
+        syncBeatEdgeCanvas();
         const canvas = visCanvasRef.value?.canvas;
         if (canvas) emit("canvasReady", canvas);
+        if (spectrumCanvasRef.value) {
+            emit("spectrumCanvasReady", spectrumCanvasRef.value);
+        }
     });
 });
 
@@ -509,6 +740,38 @@ const previewHeight = ref(360);
 const previewAspect = computed(
     () => props.exportSettings.width / props.exportSettings.height,
 );
+
+// 节拍边框辉光样式 — 鼓点触发时视频边缘一圈强烈发光闪烁
+const beatBorderStyle = computed(() => {
+    const energy = animState.beatGlowEnergy;
+    if (energy < 0.005)
+        return { borderColor: "rgba(255,255,255,0.06)", borderWidth: "1px" };
+    const hue = props.config.hue;
+    // 用 easeOutExpo 让能量映射更有爆发力：低能量时几乎看不到，高能量时爆发
+    const eased = energy < 0.1 ? energy * 0.3 : 1 - Math.pow(1 - energy, 3);
+    // 主扩散半径：随能量从 0 到 120px
+    const spread = 4 + eased * 120;
+    // 核心亮度 alpha
+    const alpha = Math.min(1, eased * 1.4);
+    // 紧凑内圈发光（紧贴边缘）
+    const innerSpread = 2 + eased * 24;
+    return {
+        boxShadow: [
+            // 第一层：紧贴边缘的亮白核心闪光
+            `0 0 ${innerSpread}px ${innerSpread * 0.2}px hsla(${hue}, 100%, 80%, ${alpha})`,
+            // 第二层：中等扩散的彩色辉光
+            `0 0 ${spread}px ${spread * 0.15}px hsla(${hue}, 100%, 60%, ${alpha * 0.85})`,
+            // 第三层：大范围柔光
+            `0 0 ${spread * 1.8}px ${spread * 0.05}px hsla(${hue}, 100%, 50%, ${alpha * 0.5})`,
+            // 第四层：超大范围极淡晕染
+            `0 0 ${spread * 3}px ${spread * 0.02}px hsla(${hue}, 80%, 55%, ${alpha * 0.25})`,
+            // 内阴影：视频内部边缘也泛光
+            `inset 0 0 ${spread * 0.6}px ${spread * 0.1}px hsla(${hue}, 90%, 60%, ${alpha * 0.55})`,
+        ].join(", "),
+        borderColor: `hsla(${hue}, 100%, 70%, ${Math.min(1, alpha * 1.2)})`,
+        borderWidth: `${1 + eased * 4}px`,
+    };
+});
 
 function computePreviewSize() {
     if (!previewContainer.value) return;
@@ -563,6 +826,7 @@ watch([previewContainer], () => {
             :style="{
                 width: previewWidth + 'px',
                 height: previewHeight + 'px',
+                ...beatBorderStyle,
             }"
         >
             <VisualizerCanvas
@@ -570,6 +834,10 @@ watch([previewContainer], () => {
                 :engine="engine as any"
                 :config="config"
             />
+            <!-- 边缘鼓点辉光叠加层（Canvas 渲染，导出可见） -->
+            <canvas ref="beatEdgeCanvasRef" class="beat-edge-canvas" />
+            <!-- 频谱可视化叠加层 -->
+            <canvas ref="spectrumCanvasRef" class="spectrum-canvas" />
             <!-- 歌词字幕叠加层 -->
             <div
                 v-if="hasLyrics && displayedLyric"
@@ -692,10 +960,12 @@ watch([previewContainer], () => {
                 </div>
                 <div class="control-row">
                     <label
-                        ><span class="param-label">色相 Hue</span
+                        ><span class="param-label">色相中心</span
                         ><span
                             class="param-value"
-                            :style="{ color: `hsl(${hueValue}, 100%, 60%)` }"
+                            :style="{
+                                color: `hsl(${hueValue}, 100%, 60%)`,
+                            }"
                             >{{ hueValue }}°</span
                         ></label
                     >
@@ -716,6 +986,132 @@ watch([previewContainer], () => {
                             "
                         />
                     </div>
+                </div>
+                <div class="control-row">
+                    <label
+                        ><span class="param-label">色相范围</span
+                        ><span class="param-value"
+                            >±{{ Math.round(hueSpread / 2) }}°</span
+                        ></label
+                    >
+                    <input
+                        type="range"
+                        min="10"
+                        max="360"
+                        step="5"
+                        :value="hueSpread"
+                        @input="
+                            hueSpread = Number(
+                                ($event.target as HTMLInputElement).value,
+                            )
+                        "
+                    />
+                </div>
+                <div class="control-row">
+                    <label
+                        ><span class="param-label">流体亮度</span
+                        ><span class="param-value">{{
+                            fluidIntensity.toFixed(1)
+                        }}</span></label
+                    >
+                    <input
+                        type="range"
+                        min="0.1"
+                        max="2.0"
+                        step="0.1"
+                        :value="fluidIntensity"
+                        @input="
+                            fluidIntensity = Number(
+                                ($event.target as HTMLInputElement).value,
+                            )
+                        "
+                    />
+                </div>
+                <div class="control-row">
+                    <label
+                        ><span class="param-label">流体活跃度</span
+                        ><span class="param-value">{{
+                            fluidActivity.toFixed(1)
+                        }}</span></label
+                    >
+                    <input
+                        type="range"
+                        min="0.1"
+                        max="2.0"
+                        step="0.1"
+                        :value="fluidActivity"
+                        @input="
+                            fluidActivity = Number(
+                                ($event.target as HTMLInputElement).value,
+                            )
+                        "
+                    />
+                </div>
+                <div class="control-row">
+                    <label><span class="param-label">动态色相</span></label>
+                    <div class="chip-row">
+                        <button
+                            class="chip"
+                            :class="{ active: hueRotate }"
+                            @click="hueRotate = !hueRotate"
+                        >
+                            {{ hueRotate ? "🌈 旋转中" : "⏸ 静止" }}
+                        </button>
+                    </div>
+                </div>
+                <div v-if="hueRotate" class="control-row">
+                    <label
+                        ><span class="param-label">旋转速度</span
+                        ><span class="param-value">{{
+                            hueRotateSpeed.toFixed(1)
+                        }}</span></label
+                    >
+                    <input
+                        type="range"
+                        min="0.1"
+                        max="5.0"
+                        step="0.1"
+                        :value="hueRotateSpeed"
+                        @input="
+                            hueRotateSpeed = Number(
+                                ($event.target as HTMLInputElement).value,
+                            )
+                        "
+                    />
+                </div>
+                <!-- ═══ 边缘鼓点闪烁 ═══ -->
+                <div class="section-sep" />
+                <div class="control-row">
+                    <label><span class="param-label">边缘鼓点闪烁</span></label>
+                    <div class="chip-row">
+                        <button
+                            class="chip"
+                            :class="{ active: beatEdgeEnabled }"
+                            @click="beatEdgeEnabled = !beatEdgeEnabled"
+                        >
+                            {{ beatEdgeEnabled ? "✨ 已启用" : "⏸ 已关闭" }}
+                        </button>
+                    </div>
+                </div>
+                <div v-if="beatEdgeEnabled" class="control-row">
+                    <label
+                        ><span class="param-label">闪烁灵敏度</span
+                        ><span class="param-value">{{
+                            beatEdgeSensitivity.toFixed(1)
+                        }}</span></label
+                    >
+                    <input
+                        type="range"
+                        min="0.5"
+                        max="2.0"
+                        step="0.1"
+                        :value="beatEdgeSensitivity"
+                        @input="
+                            beatEdgeSensitivity = Number(
+                                ($event.target as HTMLInputElement).value,
+                            )
+                        "
+                    />
                 </div>
                 <div class="preset-section">
                     <span class="param-label">配色预设</span>
@@ -738,6 +1134,175 @@ watch([previewContainer], () => {
                         </button>
                     </div>
                 </div>
+                <div class="preset-section">
+                    <span class="param-label">频谱可视化</span>
+                    <div class="chip-row">
+                        <button
+                            class="chip"
+                            :class="{ active: spectrumEnabled }"
+                            @click="spectrumEnabled = !spectrumEnabled"
+                        >
+                            {{ spectrumEnabled ? "✅ 已启用" : "⏸ 关闭" }}
+                        </button>
+                    </div>
+                </div>
+                <template v-if="spectrumEnabled">
+                    <div class="control-row">
+                        <label><span class="param-label">样式</span></label>
+                        <div class="preset-row">
+                            <button
+                                v-for="s in SPECTRUM_STYLE_OPTIONS"
+                                :key="s.value"
+                                class="chip"
+                                :class="{ active: spectrumStyle === s.value }"
+                                @click="spectrumStyle = s.value"
+                            >
+                                {{ s.label }}
+                            </button>
+                        </div>
+                    </div>
+                    <div class="control-row">
+                        <label
+                            ><span class="param-label">不透明度</span
+                            ><span class="param-value"
+                                >{{ Math.round(spectrumOpacity * 100) }}%</span
+                            ></label
+                        >
+                        <input
+                            type="range"
+                            min="10"
+                            max="100"
+                            step="5"
+                            :value="spectrumOpacity * 100"
+                            @input="
+                                spectrumOpacity =
+                                    Number(
+                                        ($event.target as HTMLInputElement)
+                                            .value,
+                                    ) / 100
+                            "
+                        />
+                    </div>
+                    <div class="control-row">
+                        <label
+                            ><span class="param-label">柱数/点数</span
+                            ><span class="param-value">{{
+                                spectrumBarCount
+                            }}</span></label
+                        >
+                        <input
+                            type="range"
+                            min="16"
+                            max="128"
+                            step="8"
+                            :value="spectrumBarCount"
+                            @input="
+                                spectrumBarCount = Number(
+                                    ($event.target as HTMLInputElement).value,
+                                )
+                            "
+                        />
+                    </div>
+                    <div class="control-row">
+                        <label
+                            ><span class="param-label">灵敏度</span
+                            ><span class="param-value"
+                                >{{
+                                    Math.round(spectrumSensitivity * 100)
+                                }}%</span
+                            ></label
+                        >
+                        <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="5"
+                            :value="spectrumSensitivity * 100"
+                            @input="
+                                spectrumSensitivity =
+                                    Number(
+                                        ($event.target as HTMLInputElement)
+                                            .value,
+                                    ) / 100
+                            "
+                        />
+                    </div>
+                    <div class="control-row">
+                        <label><span class="param-label">颜色模式</span></label>
+                        <div class="chip-row">
+                            <button
+                                class="chip"
+                                :class="{
+                                    active: spectrumColorMode === 'auto',
+                                }"
+                                @click="spectrumColorMode = 'auto'"
+                            >
+                                频段渐变
+                            </button>
+                            <button
+                                class="chip"
+                                :class="{
+                                    active: spectrumColorMode === 'hue',
+                                }"
+                                @click="spectrumColorMode = 'hue'"
+                            >
+                                跟随色相
+                            </button>
+                            <button
+                                class="chip"
+                                :class="{
+                                    active: spectrumColorMode === 'custom',
+                                }"
+                                @click="spectrumColorMode = 'custom'"
+                            >
+                                自定义
+                            </button>
+                        </div>
+                    </div>
+                    <div
+                        v-if="spectrumColorMode === 'custom'"
+                        class="control-row"
+                    >
+                        <label
+                            ><span class="param-label">自定义颜色</span
+                            ><span
+                                class="param-swatch-small"
+                                :style="{
+                                    background: spectrumCustomColor,
+                                }"
+                            />
+                        </label>
+                        <div class="color-input-row">
+                            <input
+                                type="color"
+                                class="color-picker"
+                                :value="spectrumCustomColor"
+                                @input="
+                                    spectrumCustomColor = (
+                                        $event.target as HTMLInputElement
+                                    ).value
+                                "
+                            />
+                            <input
+                                type="text"
+                                class="color-text-input"
+                                :value="spectrumCustomColor"
+                                @input="
+                                    spectrumCustomColor = (
+                                        $event.target as HTMLInputElement
+                                    ).value
+                                "
+                            />
+                        </div>
+                    </div>
+                    <button
+                        class="reset-btn"
+                        style="margin-top: 8px"
+                        @click="resetSpectrumConfig"
+                    >
+                        重置频谱
+                    </button>
+                </template>
             </div>
 
             <!-- Subtitle Tab -->
@@ -1269,25 +1834,42 @@ watch([previewContainer], () => {
                     </div>
                 </div>
                 <div class="section">
-                    <span class="section-label">输出格式</span>
-                    <div class="format-list">
+                    <span class="section-label">编码器</span>
+                    <div class="encoder-list">
                         <button
-                            v-for="fmt in formatOptions"
-                            :key="fmt.value"
-                            class="format-btn"
+                            v-for="enc in ENCODER_OPTIONS"
+                            :key="enc.value"
+                            class="encoder-btn"
                             :class="{
-                                active: localExport.format === fmt.value,
+                                active: localExport.encoder === enc.value,
                             }"
-                            @click="setFormat(fmt.value)"
+                            @click="setEncoder(enc.value)"
                         >
-                            <span class="format-name">{{ fmt.label }}</span
-                            ><span class="format-desc">{{ fmt.desc }}</span>
+                            <span class="encoder-name">{{ enc.label }}</span
+                            ><span class="encoder-desc">{{ enc.desc }}</span>
                         </button>
                     </div>
                 </div>
                 <div class="section">
+                    <span class="section-label">编码速度</span>
+                    <div class="speed-preset-list">
+                        <button
+                            v-for="opt in SPEED_PRESET_OPTIONS"
+                            :key="opt.value"
+                            class="speed-btn"
+                            :class="{
+                                active: localExport.speedPreset === opt.value,
+                            }"
+                            @click="setSpeedPreset(opt.value)"
+                        >
+                            <span class="speed-name">{{ opt.label }}</span>
+                            <span class="speed-desc">{{ opt.desc }}</span>
+                        </button>
+                    </div>
+                </div>
+                <div v-if="!isHardwareEncoder" class="section">
                     <div class="quality-header">
-                        <span class="section-label">画质</span
+                        <span class="section-label">画质 (CRF)</span
                         ><span
                             class="quality-badge"
                             :class="'q-' + qualityLabel"
@@ -1388,10 +1970,14 @@ watch([previewContainer], () => {
                         >
                     </div>
                     <div class="summary-row">
-                        <span>格式</span
+                        <span>编码</span
                         ><span
-                            >{{ localExport.format.toUpperCase() }} /
-                            {{ qualityLabel }}画质</span
+                            >{{
+                                ENCODER_OPTIONS.find(
+                                    (e) => e.value === localExport.encoder,
+                                )?.label || localExport.encoder
+                            }}
+                            · {{ qualityLabel }}</span
                         >
                     </div>
                 </div>
@@ -1414,6 +2000,27 @@ watch([previewContainer], () => {
     overflow: hidden;
     background: #0a0a14;
     flex-shrink: 0;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    transition:
+        box-shadow 0.12s ease-out,
+        border-color 0.12s ease-out,
+        border-width 0.12s ease-out;
+}
+.spectrum-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 5;
+    pointer-events: none;
+}
+.beat-edge-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 4;
+    pointer-events: none;
 }
 .player-overlay {
     position: absolute;
@@ -1576,6 +2183,11 @@ input[type="range"]::-webkit-slider-thumb:hover {
     flex-direction: column;
     gap: 8px;
 }
+.section-sep {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.06);
+    margin: 16px 0;
+}
 .preset-grid {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
@@ -1714,6 +2326,83 @@ input[type="range"]::-webkit-slider-thumb:hover {
     font-weight: 500;
 }
 .format-desc {
+    font-size: 11px;
+    opacity: 0.5;
+}
+
+.encoder-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.encoder-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 10px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+}
+.encoder-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+.encoder-btn.active {
+    border-color: #a855f7;
+    background: rgba(168, 85, 247, 0.08);
+}
+.encoder-name {
+    font-size: 13px;
+    font-weight: 500;
+}
+.encoder-desc {
+    font-size: 11px;
+    opacity: 0.5;
+}
+
+.speed-preset-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.speed-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 10px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+}
+
+.speed-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+
+.speed-btn.active {
+    border-color: #22c55e;
+    background: rgba(34, 197, 94, 0.08);
+}
+
+.speed-name {
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.speed-desc {
     font-size: 11px;
     opacity: 0.5;
 }

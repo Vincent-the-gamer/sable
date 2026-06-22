@@ -1,347 +1,421 @@
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use crate::renderer::{FrameRenderer, RendererConfig};
+// ═══════════ Cancel ═══════════
 
-// ══════════════════ 进度事件 ══════════════════
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ExportProgressEvent {
-    pub current_frame: u32,
-    pub total_frames: u32,
-    pub percent: u32,
-    pub stage: String,
-}
-
-// ══════════════════ 全局取消标志 ══════════════════
-
-static CANCEL_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
-
-fn set_cancel_flag(flag: Arc<AtomicBool>) {
-    *CANCEL_FLAG.lock().unwrap() = Some(flag);
-}
-
-fn clear_cancel_flag() {
-    *CANCEL_FLAG.lock().unwrap() = None;
-}
-
-// ══════════════════ 导出配置 ══════════════════
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportConfig {
-    pub audio_path: String,
-    pub output_path: String,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub particle_count: u32,
-    pub glow_intensity: f32,
-    pub shake_intensity: f32,
-    pub hue_min: f32,
-    pub hue_max: f32,
-    /// 自定义 ffmpeg 路径，None 则使用 PATH 中的 "ffmpeg"
-    pub ffmpeg_path: Option<String>,
-    /// 输出格式: "mp4" | "webm"
-    #[serde(default = "default_format")]
-    pub format: String,
-    /// CRF 质量 (0-51, 越小质量越高, mp4 默认 23, webm 默认 30)
-    #[serde(default = "default_crf")]
-    pub crf: u8,
-}
-
-fn default_format() -> String {
-    "mp4".to_string()
-}
-fn default_crf() -> u8 {
-    23
-}
-
-// ══════════════════ 入口：立即返回，后台执行 ══════════════════
-
-pub fn start_background_export(app: AppHandle, config: ExportConfig) -> Result<(), String> {
-    eprintln!("[sable:export] 启动后台导出线程");
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    set_cancel_flag(cancel_flag.clone());
-
-    std::thread::spawn(move || {
-        eprintln!("[sable:export] 后台线程开始执行");
-        let result = run_export(&app, &config, &cancel_flag);
-
-        match result {
-            Ok(()) => {
-                eprintln!("[sable:export] 导出成功，发送 export-done 事件");
-                let _ = app.emit("export-done", config.output_path.clone());
-            }
-            Err(e) => {
-                eprintln!("[sable:export] 导出失败: {e}");
-                let _ = app.emit("export-error", e);
-            }
-        }
-
-        clear_cancel_flag();
-        eprintln!("[sable:export] 后台线程结束");
-    });
-
-    Ok(())
-}
+static CANCEL_FLAG: Mutex<bool> = Mutex::new(false);
 
 pub fn cancel_export() {
-    eprintln!("[sable:export] 设置取消标志");
-    if let Some(flag) = CANCEL_FLAG.lock().unwrap().as_ref() {
-        flag.store(true, Ordering::SeqCst);
+    if let Ok(mut flag) = CANCEL_FLAG.lock() {
+        *flag = true;
     }
 }
 
-// ══════════════════ 后台导出主逻辑 ══════════════════
+fn is_cancelled() -> bool {
+    CANCEL_FLAG.lock().map(|f| *f).unwrap_or(false)
+}
 
-fn run_export(app: &AppHandle, config: &ExportConfig, cancel: &AtomicBool) -> Result<(), String> {
-    // 确定 ffmpeg 路径
-    let ffmpeg_path = config.ffmpeg_path.as_deref().unwrap_or("ffmpeg");
-    eprintln!("[sable:export] 使用 ffmpeg: {ffmpeg_path}");
+// ═══════════ Piped Export State ═══════════
 
-    // ── 阶段 1: 解码音频 ──
-    eprintln!("[sable:export] 阶段1: 解码音频");
-    emit_progress(app, 0, 0, 0, "decoding");
+struct PipedExport {
+    child: Child,
+    stdin: ChildStdin,
+    output_path: String,
+}
 
-    let audio_path = std::path::Path::new(&config.audio_path);
-    let audio_data =
-        crate::audio::decode_audio_file(audio_path).map_err(|e| format!("音频解码失败: {e}"))?;
+static PIPED_EXPORT: Mutex<Option<PipedExport>> = Mutex::new(None);
 
-    eprintln!(
-        "[sable:export] 音频解码完成: {} 采样, {:.2}s",
-        audio_data.samples.len(),
-        audio_data.info.duration_secs
-    );
+/// Start ffmpeg piped encoding (frames sent via send_piped_chunk)
+pub fn start_piped_export(
+    app: &AppHandle,
+    output_path: &str,
+    audio_path: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    encoder: &str,
+    _format: &str,
+    crf: u8,
+    speed_preset: &str,
+    ffmpeg_path: Option<&str>,
+) -> Result<(), String> {
+    let ffmpeg = ffmpeg_path.unwrap_or("ffmpeg");
 
-    if cancel.load(Ordering::SeqCst) {
-        eprintln!("[sable:export] 解码后被取消");
-        return Ok(());
-    }
+    // NV12 要求宽高均为偶数；上对齐以避免 VideoToolbox/swscale 硬编失败
+    let width = ((width + 1) >> 1) << 1;
+    let height = ((height + 1) >> 1) << 1;
 
-    let total_frames = (audio_data.info.duration_secs * config.fps as f64).ceil() as u32;
-    eprintln!(
-        "[sable:export] 总帧数: {total_frames} ({}x{} @ {}fps)",
-        config.width, config.height, config.fps
-    );
+    let mut cmd = Command::new(ffmpeg);
+    // 基础参数：覆盖输出，自动线程，恒定帧率，加速管道识别
+    cmd.args([
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-threads",
+        "0", // 自动检测 CPU 线程数
+        "-vsync",
+        "cfr", // 恒定帧率
+        "-f",
+        "rawvideo",
+        "-probesize",
+        "32", // 最小分析大小，加速 rawvideo 管道输入
+        "-analyzeduration",
+        "0", // 跳过流分析
+        "-s",
+        &format!("{width}x{height}"),
+        "-pix_fmt",
+        "rgba",
+        "-r",
+        &fps.to_string(),
+        "-i",
+        "pipe:0",
+        "-i",
+        audio_path,
+    ]);
 
-    // ── 阶段 2: 初始化渲染器 ──
-    eprintln!("[sable:export] 阶段2: 初始化渲染器");
-    emit_progress(app, 0, total_frames, 0, "rendering");
-
-    let renderer_config = RendererConfig {
-        particle_count: config.particle_count,
-        glow_intensity: config.glow_intensity,
-        shake_intensity: config.shake_intensity,
-        hue_range: (config.hue_min, config.hue_max),
-    };
-
-    let mut renderer = FrameRenderer::new(config.width, config.height, renderer_config);
-    renderer.set_audio_data(&audio_data.samples, audio_data.info.sample_rate);
-    renderer.reset();
-
-    if cancel.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    // ── 阶段 3: 启动 ffmpeg，逐帧渲染 + 编码 ──
-    eprintln!(
-        "[sable:export] 阶段3: 启动 ffmpeg 管道 (format={}, crf={})",
-        config.format, config.crf
-    );
-    let mut exporter = VideoExporter::start(
-        config.width,
-        config.height,
-        config.fps,
-        &config.output_path,
-        &config.audio_path,
-        ffmpeg_path,
-        &config.format,
-        config.crf,
-    )?;
-    eprintln!("[sable:export] ffmpeg 已启动，开始逐帧渲染...");
-
-    let frame_duration = 1.0 / config.fps as f64;
-
-    for i in 0..total_frames {
-        if cancel.load(Ordering::SeqCst) {
-            drop(exporter);
-            let _ = std::fs::remove_file(&config.output_path);
-            return Ok(());
+    match encoder {
+        "videotoolbox_h264" => {
+            let quality = match speed_preset {
+                "quality" => 30,
+                "balanced" => 55,
+                "fast" => 75,
+                "superfast" => 85,
+                _ => 90,
+            };
+            // VideoToolbox 需要 nv12 输入；用 -vf format=nv12 做显式格式转换
+            // 避免 -pix_fmt（无流标识符）被错误应用到音频流导致 -22 (Invalid argument)
+            cmd.args([
+                "-vf",
+                "format=nv12",
+                "-c:v",
+                "h264_videotoolbox",
+                "-q:v",
+                &quality.to_string(),
+                "-allow_sw",
+                "1",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
         }
-
-        let time_seconds = i as f64 * frame_duration;
-        let rgba = renderer.render_frame(time_seconds);
-        exporter.send_frame(&rgba)?;
-
-        if i % 10 == 0 || i == total_frames - 1 {
-            let pct = ((i + 1) as f64 / total_frames as f64 * 100.0) as u32;
-            if i % 50 == 0 || i == total_frames - 1 {
-                eprintln!("[sable:export] 帧 {i}/{total_frames} ({pct}%)");
+        "videotoolbox_hevc" => {
+            let quality = match speed_preset {
+                "quality" => 30,
+                "balanced" => 55,
+                "fast" => 75,
+                "superfast" => 85,
+                _ => 90,
+            };
+            cmd.args([
+                "-vf",
+                "format=nv12",
+                "-c:v",
+                "hevc_videotoolbox",
+                "-q:v",
+                &quality.to_string(),
+                "-allow_sw",
+                "1",
+                "-tag:v",
+                "hvc1",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+        "software_vp9" => {
+            let (cpu_used, deadline) = match speed_preset {
+                "quality" => ("0", "good"),
+                "balanced" => ("2", "good"),
+                "fast" => ("3", "realtime"),
+                "superfast" => ("4", "realtime"),
+                _ => ("5", "realtime"),
+            };
+            cmd.args([
+                "-c:v",
+                "libvpx-vp9",
+                "-crf",
+                &crf.to_string(),
+                "-b:v",
+                "0",
+                "-cpu-used",
+                cpu_used,
+                "-deadline",
+                deadline,
+                "-row-mt",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "128k",
+                "-shortest",
+            ]);
+        }
+        "software_x265" => {
+            let preset = match speed_preset {
+                "quality" => "slow",
+                "balanced" => "medium",
+                "fast" => "veryfast",
+                "superfast" => "superfast",
+                _ => "ultrafast",
+            };
+            cmd.args([
+                "-c:v",
+                "libx265",
+                "-preset",
+                preset,
+                "-crf",
+                &crf.to_string(),
+                "-pix_fmt",
+                "yuv420p",
+                "-tag:v",
+                "hvc1",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+            if preset == "ultrafast" {
+                cmd.args([
+                    "-x265-params",
+                    "no-sao=1:no-deblock=1:ref=1:bframes=0:me=dia:subme=0",
+                ]);
             }
-            emit_progress(app, i + 1, total_frames, pct, "rendering");
+        }
+        _ => {
+            // software_x264 (default)
+            let preset = match speed_preset {
+                "quality" => "slow",
+                "balanced" => "medium",
+                "fast" => "veryfast",
+                "superfast" => "superfast",
+                _ => "ultrafast",
+            };
+            cmd.args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-tune",
+                "animation",
+                "-crf",
+                &crf.to_string(),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+            if preset == "ultrafast" {
+                cmd.args([
+                    "-x264-params",
+                    "no-deblock=1:no-cabac=1:ref=1:bframes=0:scenecut=0:no-weightb=1",
+                ]);
+            }
         }
     }
 
-    eprintln!("[sable:export] 所有帧渲染完成");
+    // 防止编码队列过大导致的卡顿
+    cmd.args(["-max_muxing_queue_size", "9999"]);
+    cmd.arg(output_path);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
 
-    // ── 阶段 4: 完成编码 ──
-    eprintln!("[sable:export] 阶段4: ffmpeg 编码完成");
-    emit_progress(app, total_frames, total_frames, 100, "encoding");
-    exporter.finish()?;
-    emit_progress(app, total_frames, total_frames, 100, "done");
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
+
+    // 立即启动后台线程读取 stderr，防止管道阻塞 + 提供调试信息
+    let stderr = child.stderr.take();
+    std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let mut reader = std::io::BufReader::new(stderr);
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                            eprintln!("[ffmpeg] {}", s.trim());
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let stdin = child.stdin.take().ok_or("Cannot get ffmpeg stdin")?;
+
+    let mut guard = PIPED_EXPORT.lock().unwrap();
+    *guard = Some(PipedExport {
+        child,
+        stdin,
+        output_path: output_path.to_string(),
+    });
+
+    let _ = app.emit(
+        "export-progress",
+        serde_json::json!({
+            "current_frame": 0u32,
+            "total_frames": 0u32,
+            "percent": 0u32,
+            "stage": "rendering"
+        }),
+    );
 
     Ok(())
 }
 
-fn emit_progress(app: &AppHandle, current: u32, total: u32, percent: u32, stage: &str) {
+/// Send a chunk of frames to ffmpeg (base64 encoded RGBA data)
+pub fn send_piped_chunk(
+    app: &AppHandle,
+    base64_data: &str,
+    total_frames: u32,
+) -> Result<(), String> {
+    let mut guard = PIPED_EXPORT.lock().unwrap();
+    let export = guard.as_mut().ok_or("Pipe not started")?;
+
+    if is_cancelled() {
+        return Err("Cancelled".into());
+    }
+
+    let bytes = base64_decode(base64_data)?;
+    export
+        .stdin
+        .write_all(&bytes)
+        .map_err(|e| format!("Pipe write failed: {e}"))?;
+
     let _ = app.emit(
         "export-progress",
-        ExportProgressEvent {
-            current_frame: current,
-            total_frames: total,
-            percent,
-            stage: stage.to_string(),
-        },
+        serde_json::json!({
+            "current_frame": 0u32,
+            "total_frames": total_frames,
+            "percent": 0u32,
+            "stage": "rendering"
+        }),
     );
+
+    Ok(())
 }
 
-// ══════════════════ 视频导出器（ffmpeg 管道） ══════════════════
+/// Close stdin and wait for ffmpeg to finish
+/// Reads stderr in background to prevent pipe deadlock
+pub fn finish_piped_export(app: &AppHandle) -> Result<(), String> {
+    let mut guard = PIPED_EXPORT.lock().unwrap();
+    let mut export = guard.take().ok_or("Pipe not started")?;
 
-pub struct VideoExporter {
-    process: Child,
-    stdin: ChildStdin,
-    width: u32,
-    height: u32,
-}
+    drop(export.stdin);
 
-impl VideoExporter {
-    pub fn start(
-        width: u32,
-        height: u32,
-        fps: u32,
-        output_path: &str,
-        audio_path: &str,
-        ffmpeg_path: &str,
-        format: &str,
-        crf: u8,
-    ) -> Result<Self, String> {
-        eprintln!("[sable:export] 启动 ffmpeg: {ffmpeg_path}");
-        let mut cmd = Command::new(ffmpeg_path);
+    let _ = app.emit(
+        "export-progress",
+        serde_json::json!({
+            "current_frame": 0u32,
+            "total_frames": 0u32,
+            "percent": 100u32,
+            "stage": "encoding"
+        }),
+    );
 
-        // 公共参数：原始视频输入管道
-        cmd.args([
-            "-y",
-            "-f",
-            "rawvideo",
-            "-vcodec",
-            "rawvideo",
-            "-s",
-            &format!("{width}x{height}"),
-            "-pix_fmt",
-            "rgba",
-            "-r",
-            &fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-i",
-            audio_path,
-        ]);
-
-        // 根据格式选择不同的编码器参数
-        match format {
-            "webm" => {
-                cmd.args([
-                    "-c:v",
-                    "libvpx-vp9",
-                    "-crf",
-                    &crf.to_string(),
-                    "-b:v",
-                    "0",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    "128k",
-                    "-shortest",
-                ]);
-            }
-            _ => {
-                // 默认 mp4 (H.264)
-                cmd.args([
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    &crf.to_string(),
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-shortest",
-                    "-movflags",
-                    "+faststart",
-                ]);
+    // 后台线程读取 stderr，防止管道阻塞 + 提供调试信息
+    let stderr = export.child.stderr.take();
+    std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let mut reader = std::io::BufReader::new(stderr);
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                            eprintln!("[ffmpeg] {}", s.trim());
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
+    });
 
-        cmd.arg(output_path);
+    let status = export
+        .child
+        .wait()
+        .map_err(|e| format!("ffmpeg failed: {e}"))?;
 
-        cmd.stdin(Stdio::piped());
-        cmd.stderr(Stdio::null());
-        cmd.stdout(Stdio::null());
-
-        let mut process = cmd.spawn().map_err(|e| {
-            eprintln!("[sable:export] ffmpeg 启动失败 (路径: {ffmpeg_path}): {e}");
-            format!("启动 ffmpeg 失败 (路径: {ffmpeg_path}): {e}")
-        })?;
-        eprintln!("[sable:export] ffmpeg 进程已启动, pid={}", process.id());
-        let stdin = process.stdin.take().ok_or("无法获取 ffmpeg 标准输入")?;
-
-        Ok(Self {
-            process,
-            stdin,
-            width,
-            height,
-        })
-    }
-
-    pub fn send_frame(&mut self, rgba_bytes: &[u8]) -> Result<(), String> {
-        let expected_len = (self.width * self.height * 4) as usize;
-        if rgba_bytes.len() != expected_len {
-            return Err(format!(
-                "帧数据大小不匹配: 期望 {expected_len} 字节, 实际 {} 字节",
-                rgba_bytes.len()
-            ));
-        }
-
-        self.stdin
-            .write_all(rgba_bytes)
-            .map_err(|e| format!("写入帧数据失败: {e}"))?;
-
+    if status.success() {
+        let path = export.output_path.clone();
+        let _ = app.emit("export-done", path);
         Ok(())
+    } else {
+        let code = status.code().unwrap_or(-1);
+        Err(format!("ffmpeg exit code: {code}"))
     }
+}
 
-    pub fn finish(mut self) -> Result<(), String> {
-        drop(self.stdin);
-
-        let output = self
-            .process
-            .wait()
-            .map_err(|e| format!("等待 ffmpeg 完成失败: {e}"))?;
-
-        if output.success() {
-            Ok(())
-        } else {
-            Err(format!("ffmpeg 退出码: {}", output.code().unwrap_or(-1)))
+/// Force kill piped export
+pub fn abort_piped_export() {
+    if let Ok(mut guard) = PIPED_EXPORT.lock() {
+        if let Some(mut export) = guard.take() {
+            let _ = export.child.kill();
+            drop(export.stdin);
+            let _ = export.child.wait();
+            let _ = std::fs::remove_file(&export.output_path);
         }
     }
+}
+
+// ═══════════ Base64 ═══════════
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input = input.trim_end_matches('=');
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+
+    let mut table = [0xffu8; 128];
+    for (i, &c) in CHARS.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+
+    for byte in input.bytes() {
+        if byte > 127 {
+            return Err(format!("Invalid base64 char: {}", byte as char));
+        }
+        let value = table[byte as usize];
+        if value == 0xff {
+            return Err(format!("Invalid base64: {}", byte as char));
+        }
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Ok(output)
 }

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { VisualizerConfig, ExportSettings } from '../types'
+import type { VisualizerConfig, ExportSettings, SpectrumConfig, SubtitleConfig, LyricLine } from '../types'
+import { OfflineCompositeRenderer } from './OfflineCompositeRenderer'
 
 export interface ExportProgress {
   currentFrame: number
@@ -18,21 +19,30 @@ interface ProgressPayload {
   stage: string
 }
 
+interface AudioDecodeResult {
+  sample_rate: number
+  channels: number
+  total_frames: number
+  duration_secs: number
+  samples_base64: string
+}
+
+export interface ExportConfig {
+  visualizerConfig: VisualizerConfig
+  spectrumConfig: SpectrumConfig
+  subtitleConfig: SubtitleConfig
+  lyrics: LyricLine[]
+}
+
 /**
- * 视频导出管线：调用 Rust 后台线程完成全部渲染+编码。
- *
- * Rust 后台线程负责：音频解码 → 逐帧渲染 → ffmpeg 编码
- * 通过 Tauri 事件汇报进度，主线程完全不阻塞
- * 支持取消
+ * 视频导出管线：WebGL 流体 + 频谱 + 字幕 → base64 管道 → ffmpeg 直接编码
+ * 无临时文件，帧数据流式送入 ffmpeg stdin
  */
 export class ExportPipeline {
-  /**
-   * 启动视频导出（非阻塞，通过事件回调汇报进度）
-   */
   static startExport(
     audioFilePath: string,
     outputPath: string,
-    effectConfig: VisualizerConfig,
+    exportConfig: ExportConfig,
     exportSettings: ExportSettings,
     ffmpegPath: string,
     onProgress?: ProgressCallback,
@@ -43,9 +53,6 @@ export class ExportPipeline {
     let cancelled = false
 
     const done = new Promise<string>((resolve, reject) => {
-      console.log('[Export] 注册事件监听...')
-
-      // 监听进度
       listen<ProgressPayload>('export-progress', (event) => {
         if (cancelled) return
         const p = event.payload
@@ -55,59 +62,25 @@ export class ExportPipeline {
           percent: p.percent,
           stage: p.stage as ExportProgress['stage'],
         })
-      }).then((fn) => {
-        unlistenProgress = fn
-        console.log('[Export] progress 监听已注册')
-      })
+      }).then((fn) => { unlistenProgress = fn })
 
-      // 监听完成
       listen<string>('export-done', (event) => {
         if (cancelled) return
-        console.log('[Export] 收到 export-done:', event.payload)
         resolve(event.payload)
-      }).then((fn) => {
-        unlistenDone = fn
-        console.log('[Export] done 监听已注册')
-      })
+      }).then((fn) => { unlistenDone = fn })
 
-      // 监听错误
       listen<string>('export-error', (event) => {
         if (cancelled) return
-        console.error('[Export] 收到 export-error:', event.payload)
         reject(new Error(event.payload))
-      }).then((fn) => {
-        unlistenError = fn
-        console.log('[Export] error 监听已注册')
-      })
+      }).then((fn) => { unlistenError = fn })
 
-      // 调用 Rust 后端
-      console.log('[Export] 调用 invoke start_video_export_v2...')
-      invoke('start_video_export_v2', {
-        config: {
-          audio_path: audioFilePath,
-          output_path: outputPath,
-          width: exportSettings.width,
-          height: exportSettings.height,
-          fps: exportSettings.fps,
-          particle_count: effectConfig.particleCount,
-          glow_intensity: effectConfig.glowIntensity,
-          shake_intensity: effectConfig.shakeIntensity,
-          hue_min: effectConfig.hue,
-          hue_max: effectConfig.hue,
-          ffmpeg_path: ffmpegPath || null,
-          format: exportSettings.format,
-          crf: exportSettings.crf,
-        },
-      }).then(() => {
-        console.log('[Export] invoke 返回成功，等待后台线程完成...')
-      }).catch((err) => {
-        console.error('[Export] invoke 失败:', err)
-        reject(err)
-      })
+      startExportFlow(
+        audioFilePath, outputPath, exportConfig, exportSettings,
+        ffmpegPath, onProgress, () => cancelled,
+      ).catch(reject)
     })
 
     const cancel = () => {
-      console.log('[Export] 取消导出')
       cancelled = true
       invoke('cancel_video_export').catch(() => {})
       unlistenProgress?.()
@@ -123,4 +96,114 @@ export class ExportPipeline {
 
     return { cancel, done }
   }
+}
+
+async function startExportFlow(
+  audioFilePath: string,
+  outputPath: string,
+  exportConfig: ExportConfig,
+  exportSettings: ExportSettings,
+  ffmpegPath: string,
+  onProgress?: ProgressCallback,
+  isCancelled?: () => boolean,
+): Promise<void> {
+  // 对齐到偶数：NV12 格式要求宽高为偶数，否则 VideoToolbox 硬编失败
+  const width = (exportSettings.width + 1) & ~1
+  const height = (exportSettings.height + 1) & ~1
+  const fps = exportSettings.fps
+  const frameDuration = 1.0 / fps
+  const frameSize = width * height * 4
+
+  // ═══ 阶段 1: 解码 ═══
+  onProgress?.({ currentFrame: 0, totalFrames: 0, percent: 0, stage: 'decoding' })
+
+  const audioData = await invoke<AudioDecodeResult>('decode_audio_for_export', { path: audioFilePath })
+  if (isCancelled?.()) return
+
+  const pcmBytes = _b64dec(audioData.samples_base64)
+  const pcmF32 = new Float32Array(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength))
+  const totalFrames = Math.ceil(audioData.duration_secs * fps)
+
+  console.log(`[Export] ${audioData.duration_secs.toFixed(1)}s, ${totalFrames} 帧, ${width}x${height}`)
+
+  // ═══ 阶段 2: 启动 ffmpeg 管道 ═══
+  await invoke('start_piped_export', {
+    outputPath,
+    audioPath: audioFilePath,
+    width, height, fps,
+    encoder: exportSettings.encoder,
+    format: exportSettings.format,
+    crf: exportSettings.crf,
+    speedPreset: exportSettings.speedPreset ?? 'ultrafast',
+    ffmpegPath: ffmpegPath || null,
+  })
+  if (isCancelled?.()) return
+
+  // ═══ 阶段 3: 渲染 + 管道写入 ═══
+  const renderer = new OfflineCompositeRenderer(
+    width, height,
+    exportConfig.visualizerConfig,
+    exportConfig.spectrumConfig,
+    exportConfig.subtitleConfig,
+    exportConfig.lyrics,
+  )
+  renderer.setAudioData(pcmF32, audioData.sample_rate)
+
+  // 批量发送：CHUNK 大小调整以减少 IPC 开销同时保持 UI 响应
+  // 480p: ~1.2MB/frame, CHUNK=12 → ~14MB/chunk
+  // 1080p: ~8MB/frame, CHUNK=4 → ~32MB/chunk
+  const CHUNK = Math.max(1, Math.floor(20_000_000 / frameSize))
+  const totalBufSize = CHUNK * frameSize
+  let chunkBuf = new Uint8Array(totalBufSize)
+  let cnt = 0
+  const t0 = performance.now()
+
+  for (let i = 0; i < totalFrames; i++) {
+    if (isCancelled?.()) { renderer.destroy(); return }
+
+    const pixels = renderer.renderFrame(i * frameDuration, frameDuration)
+    chunkBuf.set(pixels, cnt * frameSize)
+    cnt++
+
+    if (cnt >= CHUNK || i === totalFrames - 1) {
+      await invoke('send_piped_chunk', {
+        dataBase64: _b64enc(chunkBuf.subarray(0, cnt * frameSize)),
+        totalFrames,
+      })
+      cnt = 0
+
+      const pct = Math.round(((i + 1) / totalFrames) * 100)
+      onProgress?.({ currentFrame: i + 1, totalFrames, percent: pct, stage: 'rendering' })
+    }
+  }
+
+  // 渲染完成，释放 GPU 资源
+  renderer.destroy()
+
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1)
+  const avgMs = totalFrames > 0 ? ((performance.now() - t0) / totalFrames).toFixed(1) : '?'
+  console.log(`[Export] 渲染完成 ${elapsed}s, 平均 ${avgMs}ms/帧`)
+
+  if (isCancelled?.()) return
+
+  // ═══ 阶段 4: 关闭管道 ═══
+  onProgress?.({ currentFrame: totalFrames, totalFrames, percent: 100, stage: 'encoding' })
+  await invoke('finish_piped_export')
+  console.log('[Export] 完成')
+}
+
+function _b64dec(b64: string): Uint8Array {
+  const s = atob(b64)
+  const b = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i)
+  return b
+}
+
+function _b64enc(bytes: Uint8Array): string {
+  const K = 0x8000
+  const parts: string[] = []
+  for (let i = 0; i < bytes.length; i += K) {
+    parts.push(String.fromCharCode(...bytes.subarray(i, i + K)))
+  }
+  return btoa(parts.join(''))
 }

@@ -1,48 +1,41 @@
 mod audio;
 mod export;
-mod renderer;
 
 use audio::decode_audio_file;
 use serde::Serialize;
+use std::path::Path;
 
-/// 返回给前端的音频元信息 + PCM 数据
 #[derive(Debug, Serialize)]
 struct AudioDecodeResult {
-    info: audio::DecodedAudio,
+    sample_rate: u32,
+    channels: u16,
+    total_frames: u64,
+    duration_secs: f64,
     samples_base64: String,
 }
 
-/// 读取文件的原始字节（base64 返回）
 #[tauri::command]
 fn read_file_bytes(path: String) -> Result<String, String> {
-    eprintln!("[sable:lib] read_file_bytes: {path}");
     let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
-    eprintln!("[sable:lib] read_file_bytes: 读取 {} 字节", bytes.len());
     Ok(base64_encode(&bytes))
 }
 
-/// 读取文本文件（UTF-8）
 #[tauri::command]
 fn read_file_text(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))
 }
 
-/// 写入文本文件（UTF-8）
 #[tauri::command]
 fn write_file_text(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| format!("写入文件失败: {e}"))
 }
 
-/// 枚举系统字体
 #[tauri::command]
 fn list_system_fonts() -> Vec<String> {
     let db = fontdb::Database::new();
     let mut names: Vec<String> = db
         .faces()
-        .filter_map(|info| {
-            let families = &info.families;
-            families.first().map(|(name, _)| name.to_string())
-        })
+        .filter_map(|info| info.families.first().map(|(n, _)| n.to_string()))
         .collect();
     names.sort();
     names.dedup();
@@ -50,80 +43,79 @@ fn list_system_fonts() -> Vec<String> {
     names
 }
 
-/// 解码音频文件（旧接口，保留兼容）
 #[tauri::command]
-fn decode_audio(path: String) -> Result<AudioDecodeResult, String> {
-    eprintln!("[sable:lib] decode_audio: {path}");
-    let audio_data = decode_audio_file(std::path::Path::new(&path))?;
-    eprintln!(
-        "[sable:lib] decode_audio: 采样率={}, 声道={}, 帧数={}, 时长={:.2}s",
-        audio_data.info.sample_rate,
-        audio_data.info.channels,
-        audio_data.info.total_frames,
-        audio_data.info.duration_secs
-    );
+fn decode_audio_for_export(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<AudioDecodeResult, String> {
+    let audio_data = decode_audio_file(&app, Path::new(&path))?;
 
     let bytes: &[u8] = bytemuck::cast_slice(&audio_data.samples);
     let samples_base64 = base64_encode(bytes);
 
     Ok(AudioDecodeResult {
-        info: audio_data.info,
+        sample_rate: audio_data.info.sample_rate,
+        channels: audio_data.info.channels,
+        total_frames: audio_data.info.total_frames,
+        duration_secs: audio_data.info.duration_secs,
         samples_base64,
     })
 }
 
-// ── 新的视频导出接口（后台线程，非阻塞） ──
+// ── 管道导出（无临时文件） ──
 
-/// 启动后台视频导出，通过 Tauri 事件汇报进度
-///
-/// 事件：
-/// - `export-progress`: ExportProgressEvent
-/// - `export-done`: 输出文件路径 (String)
-/// - `export-error`: 错误消息 (String)
 #[tauri::command]
-async fn start_video_export_v2(
+fn start_piped_export(
     app: tauri::AppHandle,
-    config: export::ExportConfig,
+    output_path: String,
+    audio_path: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    encoder: String,
+    format: String,
+    crf: u8,
+    speed_preset: String,
+    ffmpeg_path: Option<String>,
 ) -> Result<(), String> {
-    eprintln!("[sable:lib] start_video_export_v2: audio={}, output={}, {}x{}@{}fps, particles={}, ffmpeg={:?}",
-        config.audio_path, config.output_path, config.width, config.height,
-        config.fps, config.particle_count, config.ffmpeg_path);
-    // 立即返回，所有工作在后台线程完成
-    export::start_background_export(app, config)
+    export::start_piped_export(
+        &app,
+        &output_path,
+        &audio_path,
+        width,
+        height,
+        fps,
+        &encoder,
+        &format,
+        crf,
+        &speed_preset,
+        ffmpeg_path.as_deref(),
+    )
 }
 
-/// 取消正在进行的导出
+#[tauri::command]
+fn send_piped_chunk(
+    app: tauri::AppHandle,
+    data_base64: String,
+    total_frames: u32,
+) -> Result<(), String> {
+    export::send_piped_chunk(&app, &data_base64, total_frames)
+}
+
+#[tauri::command]
+fn finish_piped_export(app: tauri::AppHandle) -> Result<(), String> {
+    export::finish_piped_export(&app)
+}
+
 #[tauri::command]
 fn cancel_video_export() -> Result<(), String> {
-    eprintln!("[sable:lib] cancel_video_export: 收到取消请求");
     export::cancel_export();
+    export::abort_piped_export();
     Ok(())
 }
 
-// ── 旧接口（保留兼容，但不再使用） ──
+// ── Base64 ──
 
-#[tauri::command]
-fn start_video_export(
-    _width: u32,
-    _height: u32,
-    _fps: u32,
-    _output_path: String,
-    _audio_path: String,
-) -> Result<(), String> {
-    Err("请使用新的 start_video_export_v2 接口".into())
-}
-
-#[tauri::command]
-fn send_video_frame(_rgba_bytes: Vec<u8>) -> Result<(), String> {
-    Err("请使用新的 start_video_export_v2 接口".into())
-}
-
-#[tauri::command]
-fn finish_video_export() -> Result<(), String> {
-    Err("请使用新的 start_video_export_v2 接口".into())
-}
-
-/// 简单的 base64 编码
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
@@ -132,16 +124,13 @@ fn base64_encode(data: &[u8]) -> String {
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
         let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
         let n = (b0 << 16) | (b1 << 8) | b2;
-
         result.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
         result.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
-
         if chunk.len() > 1 {
             result.push(CHARS[((n >> 6) & 0x3F) as usize] as char);
         } else {
             result.push('=');
         }
-
         if chunk.len() > 2 {
             result.push(CHARS[(n & 0x3F) as usize] as char);
         } else {
@@ -162,11 +151,10 @@ pub fn run() {
             read_file_text,
             write_file_text,
             list_system_fonts,
-            decode_audio,
-            start_video_export,
-            send_video_frame,
-            finish_video_export,
-            start_video_export_v2,
+            decode_audio_for_export,
+            start_piped_export,
+            send_piped_chunk,
+            finish_piped_export,
             cancel_video_export,
         ])
         .run(tauri::generate_context!())

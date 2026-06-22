@@ -97,6 +97,11 @@ const props = defineProps<{
         glowIntensity: number;
         shakeIntensity: number;
         hue: number;
+        hueSpread: number;
+        fluidIntensity: number;
+        fluidActivity: number;
+        hueRotate: boolean;
+        hueRotateSpeed: number;
     };
     ffmpegPath?: string;
 }>();
@@ -230,6 +235,21 @@ onUnmounted(() => {
                     <span class="value"
                         >{{ props.visualizerConfig.glowIntensity }} /
                         {{ props.visualizerConfig.shakeIntensity }}</span
+                    >
+                </div>
+                <div class="state-row" v-if="props.visualizerConfig">
+                    <span class="key">色相/范围</span>
+                    <span class="value"
+                        >{{ props.visualizerConfig.hue }}° ±{{
+                            Math.round(props.visualizerConfig.hueSpread / 2)
+                        }}°</span
+                    >
+                </div>
+                <div class="state-row" v-if="props.visualizerConfig">
+                    <span class="key">亮度/活跃度</span>
+                    <span class="value"
+                        >{{ props.visualizerConfig.fluidIntensity }} /
+                        {{ props.visualizerConfig.fluidActivity }}</span
                     >
                 </div>
                 <div class="state-row" v-if="props.latestSpectrum">
