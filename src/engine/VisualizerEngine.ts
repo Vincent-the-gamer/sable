@@ -30,6 +30,7 @@ export class VisualizerEngine {
     hueRotateSpeed: 1.0,
     beatEdgeEnabled: true,
     beatEdgeSensitivity: 1.0,
+    beatEdgeWidth: 0.12,
   }
 
   constructor(canvas: HTMLCanvasElement) {

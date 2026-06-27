@@ -50,6 +50,8 @@ const props = defineProps<{
     hasLyrics: boolean;
     subtitleConfig: SubtitleConfig;
     latestBeat: BeatResult;
+    /** 平滑鼓点频段能量 (0-1)，连续信号，用于边缘闪烁 */
+    drumEnergy: number;
     spectrumConfig: SpectrumConfig;
 }>();
 
@@ -120,6 +122,10 @@ const beatEdgeSensitivity = computed({
     get: () => props.config.beatEdgeSensitivity ?? 1.0,
     set: (v) => emitConfig({ beatEdgeSensitivity: v }),
 });
+const beatEdgeWidth = computed({
+    get: () => props.config.beatEdgeWidth ?? 0.12,
+    set: (v) => emitConfig({ beatEdgeWidth: v }),
+});
 
 function emitConfig(partial: Partial<VisualizerConfig>) {
     emit("update:config", { ...props.config, ...partial });
@@ -151,6 +157,7 @@ function resetConfig() {
         hueRotateSpeed: 1.0,
         beatEdgeEnabled: true,
         beatEdgeSensitivity: 1.0,
+        beatEdgeWidth: 0.12,
     });
 }
 
@@ -413,19 +420,17 @@ function doBeatEffect() {
 }
 
 function tickAnimation() {
-    // 节拍边框辉光：鼓点触发时瞬间闪亮，然后快速衰减（模仿打击乐包络）
-    if (props.config.beatEdgeEnabled !== false) {
+    // 节拍边框辉光：纯鼓点触发 — 只在节拍瞬间闪亮，快速衰减到零
+    if (props.config.beatEdgeEnabled !== false && props.isPlaying) {
         if (props.latestBeat?.isBeat && props.latestBeat.intensity > 0.05) {
-            // 鼓点瞬间：直接拉到检测强度（叠加一点当前残留增强连续性）
-            const target = props.latestBeat.intensity;
+            // 鼓点瞬间：拉到检测强度，瞬间闪亮
             animState.beatGlowEnergy = Math.max(
-                target,
-                animState.beatGlowEnergy * 0.15 + target * 0.85,
+                0.65,
+                props.latestBeat.intensity * 1.3,
             );
         }
-        // 衰减：0.84 倍率 ≈ 15 帧 (250ms) 后降到峰值的 ~7%
-        // 比之前 0.88 更快衰减，让闪动精准对齐鼓点节奏
-        animState.beatGlowEnergy *= 0.84;
+        // 衰减：0.82 倍率 ≈ 10 帧 (160ms) 后降到峰值 ~14%
+        animState.beatGlowEnergy *= 0.85;
         if (animState.beatGlowEnergy < 0.003) animState.beatGlowEnergy = 0;
     } else {
         animState.beatGlowEnergy = 0;
@@ -649,7 +654,7 @@ function renderBeatEdgeGlow() {
     const alpha = Math.min(1, eased * 1.3);
 
     // 辉光带宽度（从边缘向内延伸的像素数，相对于画布尺寸）
-    const maxGlowWidth = Math.min(w, h) * 0.18;
+    const maxGlowWidth = Math.min(w, h) * (props.config.beatEdgeWidth ?? 0.12);
     const glowWidth = maxGlowWidth * eased;
 
     ctx.save();
@@ -747,14 +752,14 @@ const beatBorderStyle = computed(() => {
     if (energy < 0.005)
         return { borderColor: "rgba(255,255,255,0.06)", borderWidth: "1px" };
     const hue = props.config.hue;
-    // 用 easeOutExpo 让能量映射更有爆发力：低能量时几乎看不到，高能量时爆发
-    const eased = energy < 0.1 ? energy * 0.3 : 1 - Math.pow(1 - energy, 3);
-    // 主扩散半径：随能量从 0 到 120px
-    const spread = 4 + eased * 120;
-    // 核心亮度 alpha
-    const alpha = Math.min(1, eased * 1.4);
-    // 紧凑内圈发光（紧贴边缘）
-    const innerSpread = 2 + eased * 24;
+    // easeOutCubic：平滑映射，低能量也有可见辉光
+    const eased = 1 - Math.pow(1 - Math.min(1, energy), 3);
+    // 主扩散半径
+    const spread = 4 + eased * 140;
+    // 核心亮度 alpha — 提升到 1.6 倍让闪光更刺眼
+    const alpha = Math.min(1, eased * 1.6);
+    // 紧凑内圈发光
+    const innerSpread = 2 + eased * 32;
     return {
         boxShadow: [
             // 第一层：紧贴边缘的亮白核心闪光
@@ -1110,6 +1115,27 @@ watch([previewContainer], () => {
                             beatEdgeSensitivity = Number(
                                 ($event.target as HTMLInputElement).value,
                             )
+                        "
+                    />
+                </div>
+                <div v-if="beatEdgeEnabled" class="control-row">
+                    <label
+                        ><span class="param-label">辉光宽度</span
+                        ><span class="param-value">{{
+                            (beatEdgeWidth * 100).toFixed(0) + "%"
+                        }}</span></label
+                    >
+                    <input
+                        type="range"
+                        min="2"
+                        max="40"
+                        step="1"
+                        :value="Math.round(beatEdgeWidth * 100)"
+                        @input="
+                            beatEdgeWidth =
+                                Number(
+                                    ($event.target as HTMLInputElement).value,
+                                ) / 100
                         "
                     />
                 </div>

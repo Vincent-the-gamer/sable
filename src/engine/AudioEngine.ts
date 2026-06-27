@@ -64,7 +64,9 @@ export class AudioEngine {
     // 创建分析器节点
     this.analyser = ctx.createAnalyser()
     this.analyser.fftSize = this.FFT_SIZE
-    this.analyser.smoothingTimeConstant = 0.35
+    this.analyser.minDecibels = -80
+    this.analyser.maxDecibels = -10
+    this.analyser.smoothingTimeConstant = 0
 
     // 创建增益节点
     this.gainNode = ctx.createGain()
@@ -150,6 +152,8 @@ export class AudioEngine {
         waveform: new Uint8Array(),
         averageEnergy: 0,
         bassEnergy: 0,
+        drumEnergy: 0,
+        melodicEnergy: 0,
       }
     }
 
@@ -173,11 +177,45 @@ export class AudioEngine {
     }
     const bassEnergy = bassSum / (bassBins * 255)
 
+    // ── 鼓点频段：bin 1-10 (43-430 Hz)，排除 bin 0 (DC/极低频噪声) ──
+    // 覆盖 kick (40-100 Hz, bin 1-2)、snare (200-500 Hz, bin 4-11)、toms (100-300 Hz, bin 2-7)
+    const drumStart = 1
+    const drumEnd = Math.min(10, this.freqData.length - 1)
+    let drumSum = 0
+    const drumCount = drumEnd - drumStart + 1
+    for (let i = drumStart; i <= drumEnd; i++) {
+      drumSum += this.freqData[i]
+    }
+    const drumEnergy = drumSum / (drumCount * 255)
+
+    // ── 旋律频段：bin 11+ (430 Hz+)，覆盖人声/乐器/和声 ──
+    const melStart = Math.min(11, this.freqData.length - 1)
+    const melEnd = this.freqData.length - 1
+    if (melEnd > melStart) {
+      let melSum = 0
+      const melCount = melEnd - melStart + 1
+      for (let i = melStart; i <= melEnd; i++) {
+        melSum += this.freqData[i]
+      }
+      const melodicEnergy = melSum / (melCount * 255)
+
+      return {
+        frequency: new Uint8Array(this.freqData),
+        waveform: new Uint8Array(this.waveData),
+        averageEnergy,
+        bassEnergy,
+        drumEnergy,
+        melodicEnergy,
+      }
+    }
+
     return {
       frequency: new Uint8Array(this.freqData),
       waveform: new Uint8Array(this.waveData),
       averageEnergy,
       bassEnergy,
+      drumEnergy,
+      melodicEnergy: 0,
     }
   }
 

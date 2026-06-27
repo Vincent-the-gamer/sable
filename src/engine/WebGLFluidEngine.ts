@@ -1078,7 +1078,10 @@ export class WebGLFluidEngine {
 
     // 音频驱动的染料注入
     if (spectrum) {
-      this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * 0.15
+      // dt-aware 平滑：保持 ~100ms 时间常数
+      const tau = 0.10
+      const s = 1 - Math.exp(-dt / tau)
+      this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * s
       this.generateAudioSplats(spectrum, beat, dt)
     } else {
       this.currentAudioEnergy *= 0.9
@@ -1126,8 +1129,10 @@ export class WebGLFluidEngine {
 
       // 计算整体音频能量（给 step 做动态物理调制）
       if (spectrum) {
-        // 平滑过渡
-        this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * 0.15
+        // dt-aware 平滑：保持 ~100ms 时间常数，帧率无关
+        const tau = 0.10
+        const s = 1 - Math.exp(-dt / tau)
+        this.currentAudioEnergy += (spectrum.averageEnergy - this.currentAudioEnergy) * s
       } else {
         // 无音频时逐渐归零
         this.currentAudioEnergy *= 0.9
@@ -1281,25 +1286,23 @@ export class WebGLFluidEngine {
     const activityMul = this.config.fluidActivity ?? 1.0
     // 活跃度越低 → 阈值越高，避免低能量时也满屏
 
-    // 整体平均能量，用于控制动态级别
-    let totalEnergy = 0
-    for (let i = 0; i < freq.length; i++) totalEnergy += freq[i]
-    const avgEnergy = totalEnergy / (freq.length * 255)
+    // ── 旋律能量：mid-high 频段驱动流体，鼓点低频专属边缘闪烁 ──
+    const melodicEnergy = spectrum.melodicEnergy ?? spectrum.averageEnergy
 
-    // ═══ 全局能量层：全屏底色随能量涨落 ═══
-    if (avgEnergy > 0.04) {
-      const globalSpread = Math.ceil(avgEnergy * 5 * activityMul)
+    // ═══ 全局能量层：基于旋律能量而非全频 ═══
+    if (melodicEnergy > 0.03) {
+      const globalSpread = Math.ceil(melodicEnergy * 5 * activityMul)
       for (let i = 0; i < globalSpread; i++) {
         const gColor = this.generateColor()
-        const gBright = (0.04 + avgEnergy * 0.6) * intensityMul
+        const gBright = (0.03 + melodicEnergy * 0.6) * intensityMul
         gColor[0] *= gBright
         gColor[1] *= gBright
         gColor[2] *= gBright
         this.pendingSplats.push({
           x: 0.1 + Math.random() * 0.8,
           y: 0.1 + Math.random() * 0.8,
-          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.4,
-          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * avgEnergy * 0.4,
+          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * melodicEnergy * 0.4,
+          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * melodicEnergy * 0.4,
           color: gColor,
         })
       }
@@ -1313,6 +1316,9 @@ export class WebGLFluidEngine {
       const bandEnergy = bandSum / ((binEnd - binStart) * 255)
 
       if (bandEnergy < 0.008) continue
+
+      // 跳过鼓点频段（bin 0-10, ~0-430 Hz），这些频段专属边缘闪烁
+      if (binEnd <= 12) continue
 
       const bp = this.bandPositions[b]
       const color = bp.color
@@ -1369,17 +1375,17 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 全局随机散布
-    if (avgEnergy > 0.05) {
-      const scatterCount = Math.ceil(avgEnergy * 10 * activityMul)
+    // 全局随机散布（仅基于旋律能量）
+    if (melodicEnergy > 0.04) {
+      const scatterCount = Math.ceil(melodicEnergy * 10 * activityMul)
       for (let i = 0; i < scatterCount; i++) {
         const color = this.generateColor()
-        const brightness = (0.12 + avgEnergy * 1.2) * intensityMul
+        const brightness = (0.10 + melodicEnergy * 1.2) * intensityMul
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const fm = this.fluidConfig.SPLAT_FORCE * avgEnergy * 1.0
+        const fm = this.fluidConfig.SPLAT_FORCE * melodicEnergy * 1.0
         this.pendingSplats.push({
           x: Math.random(),
           y: Math.random(),
@@ -1390,40 +1396,20 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 节拍爆发
-    if (beat.isBeat && beat.intensity > 0.2) {
-      const burstCount = Math.ceil((12 + beat.intensity * 25) * activityMul)
-      for (let i = 0; i < burstCount; i++) {
+    // ═══ 鼓点不主导流体：仅留极微弱痕迹，鼓点专属边缘闪烁 ═══
+    if (beat.isBeat && beat.intensity > 0.3 && spectrum.drumEnergy > 0.12) {
+      const drumTraceCount = Math.ceil(beat.intensity * 4 * activityMul)
+      for (let i = 0; i < drumTraceCount; i++) {
         const color = this.generateColor()
-        const brightness = (0.5 + beat.intensity * 3.5) * intensityMul
+        const brightness = beat.intensity * 0.3 * intensityMul
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
-        const angle = Math.random() * Math.PI * 2
-        const speed = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.8
         this.pendingSplats.push({
-          x: 0.1 + Math.random() * 0.8,
-          y: 0.1 + Math.random() * 0.8,
-          dx: Math.cos(angle) * speed,
-          dy: Math.sin(angle) * speed,
-          color,
-        })
-      }
-
-      const radialCount = Math.ceil(beat.intensity * 12 * activityMul)
-      for (let i = 0; i < radialCount; i++) {
-        const color = this.generateColor()
-        color[0] *= beat.intensity * 3 * intensityMul
-        color[1] *= beat.intensity * 3 * intensityMul
-        color[2] *= beat.intensity * 3 * intensityMul
-        const a = (i / radialCount) * Math.PI * 2
-        const r = 0.03 + Math.random() * 0.12
-        const spd = this.fluidConfig.SPLAT_FORCE * beat.intensity * 1.5
-        this.pendingSplats.push({
-          x: 0.5 + Math.cos(a) * r,
-          y: 0.5 + Math.sin(a) * r,
-          dx: Math.cos(a) * spd,
-          dy: Math.sin(a) * spd,
+          x: 0.2 + Math.random() * 0.6,
+          y: 0.2 + Math.random() * 0.6,
+          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.3,
+          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * beat.intensity * 0.3,
           color,
         })
       }

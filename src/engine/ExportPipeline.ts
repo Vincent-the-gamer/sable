@@ -149,6 +149,18 @@ async function startExportFlow(
   )
   renderer.setAudioData(pcmF32, audioData.sample_rate)
 
+  // 预热：预跑 ~0.3s 的帧以积累染料，避免开头空白
+  const warmupFrames = Math.min(totalFrames, Math.ceil(0.3 * fps))
+  for (let i = 0; i < warmupFrames; i++) {
+    if (isCancelled?.()) { renderer.destroy(); return }
+    renderer.renderFrame(i * frameDuration, frameDuration)
+  }
+  // 重置状态，从 t=0 开始正式渲染
+  renderer.reset()
+  renderer.setAudioData(pcmF32, audioData.sample_rate)
+  // 不再额外 primeFluid：预热阶段已积累染料，避免开头高亮突兀
+  console.log(`[Export] 预热完成: ${warmupFrames} 帧`)
+
   // 批量发送：CHUNK 大小调整以减少 IPC 开销同时保持 UI 响应
   // 480p: ~1.2MB/frame, CHUNK=12 → ~14MB/chunk
   // 1080p: ~8MB/frame, CHUNK=4 → ~32MB/chunk

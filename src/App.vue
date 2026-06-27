@@ -24,6 +24,9 @@ import type {
 import { DEFAULT_SUBTITLE_CONFIG, DEFAULT_SPECTRUM_CONFIG } from "./types";
 import type { ExportProgress as ExportProgressData } from "./engine/ExportPipeline";
 
+// Version
+import { version } from "../package.json";
+
 // ═══════════ Pages ═══════════
 type Page = "home" | "studio" | "settings" | "debug";
 const currentPage = ref<Page>("home");
@@ -42,6 +45,7 @@ const loadedFilePath = ref("");
 
 const latestSpectrum = ref<SpectrumData | null>(null);
 const latestBeat = ref<BeatResult>({ isBeat: false, intensity: 0 });
+const drumEnergy = ref(0);
 
 // ═══════════ Config ═══════════
 const visualizerConfig = ref<VisualizerConfig>({
@@ -56,6 +60,7 @@ const visualizerConfig = ref<VisualizerConfig>({
     hueRotateSpeed: 1.0,
     beatEdgeEnabled: true,
     beatEdgeSensitivity: 1.0,
+    beatEdgeWidth: 0.12,
 });
 
 const exportSettings = ref<ExportSettings>({
@@ -65,7 +70,7 @@ const exportSettings = ref<ExportSettings>({
     encoder: "videotoolbox_h264",
     format: "mp4",
     crf: 23,
-    speedPreset: "ultrafast",
+    speedPreset: "balanced",
 });
 
 // ═══════════ Export State ═══════════
@@ -120,8 +125,10 @@ function startTimeTracker() {
         if (audioEngine.isPlaying) {
             currentTime.value = audioEngine.currentTime;
             latestSpectrum.value = audioEngine.getSpectrumData();
-            if (latestSpectrum.value)
+            if (latestSpectrum.value) {
                 latestBeat.value = beatDetector.detect(latestSpectrum.value);
+                drumEnergy.value = beatDetector.drumLevel;
+            }
             // 同步歌词
             if (lyrics.value.length > 0) {
                 const t = audioEngine.currentTime;
@@ -443,7 +450,7 @@ onUnmounted(() => {
                 </button>
             </nav>
             <div class="sidebar-footer">
-                <span class="version">v0.3.0</span>
+                <span class="version">v{{ version }}</span>
             </div>
         </aside>
 
@@ -475,6 +482,7 @@ onUnmounted(() => {
                 :has-lyrics="hasLyrics"
                 :subtitle-config="subtitleConfig"
                 :latest-beat="latestBeat"
+                :drum-energy="drumEnergy"
                 :spectrum-config="spectrumConfig"
                 @update:config="onUpdateConfig"
                 @update:export-settings="onUpdateExportSettings"

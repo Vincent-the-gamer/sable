@@ -76,15 +76,19 @@ pub fn start_piped_export(
         audio_path,
     ]);
 
+    // 高质量色度缩放（对流体渐变内容非常重要）
+    cmd.args(["-sws_flags", "lanczos+accurate_rnd+full_chroma_int"]);
+
     match encoder {
         "videotoolbox_h264" => {
             // VideoToolbox 不支持 -q:v，需根据分辨率和帧率计算目标码率
+            // 流体渐变内容需要更高码率：bpp 比普通视频高 50%
             let bpp = match speed_preset {
-                "quality" => 0.20,
-                "balanced" => 0.12,
-                "fast" => 0.07,
-                "superfast" => 0.04,
-                _ => 0.02,
+                "quality" => 0.45,
+                "balanced" => 0.30,
+                "fast" => 0.18,
+                "superfast" => 0.12,
+                _ => 0.08,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
             let bitrate_str = bitrate.to_string();
@@ -118,11 +122,11 @@ pub fn start_piped_export(
         "videotoolbox_hevc" => {
             // HEVC 效率更高，码率约为 H.264 的 70%
             let bpp = match speed_preset {
-                "quality" => 0.14,
-                "balanced" => 0.084,
-                "fast" => 0.049,
-                "superfast" => 0.028,
-                _ => 0.014,
+                "quality" => 0.31,
+                "balanced" => 0.21,
+                "fast" => 0.13,
+                "superfast" => 0.08,
+                _ => 0.055,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
             let bitrate_str = bitrate.to_string();

@@ -21,6 +21,10 @@ export interface SpectrumData {
   averageEnergy: number
   /** 低频能量 (0-1)，用于节拍检测 */
   bassEnergy: number
+  /** 鼓点频段能量 (0-1)：bin 1-10 (43-430 Hz)，覆盖 kick/snare/toms */
+  drumEnergy: number
+  /** 旋律频段能量 (0-1)：bin 11+ (430 Hz+)，覆盖人声/乐器/和声 */
+  melodicEnergy: number
 }
 
 /** 节拍检测结果 */
@@ -225,9 +229,11 @@ export interface VisualizerConfig {
   hueRotateSpeed: number
   /** 边缘鼓点闪烁：是否启用 */
   beatEdgeEnabled: boolean
-  /** 边缘鼓点闪烁：灵敏度 (0.5-2.0)，值越大越容易触发 */
-  beatEdgeSensitivity: number
-}
+  	/** 边缘鼓点闪烁：灵敏度 (0.5-2.0)，值越大越容易触发 */
+  	beatEdgeSensitivity: number
+  	/** 边缘鼓点闪烁：辉光宽度 (0.02-0.40)，相对于画布短边的比例 */
+  	beatEdgeWidth: number
+  }
 
 /** 编码器选项 */
 export type VideoEncoder = 'videotoolbox_h264' | 'videotoolbox_hevc' | 'software_x264' | 'software_x265' | 'software_vp9'

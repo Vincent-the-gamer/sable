@@ -1,6 +1,7 @@
 import type { SpectrumData, BeatResult, VisualizerConfig, SpectrumConfig, SubtitleConfig, LyricLine } from '../types'
 import { WebGLFluidEngine } from './WebGLFluidEngine'
 import { FftAnalyzer } from './FftAnalyzer'
+import { BeatDetector } from './BeatDetector'
 
 /**
  * 离线复合渲染器：将所有预览中的特效合成为一帧输出
@@ -20,6 +21,7 @@ export class OfflineCompositeRenderer {
   private compositeCanvas: HTMLCanvasElement
   private ctx2d: CanvasRenderingContext2D
   private fft: FftAnalyzer
+  private beatDetector: BeatDetector
 
   readonly width: number
   readonly height: number
@@ -27,12 +29,6 @@ export class OfflineCompositeRenderer {
   // 音频数据
   private samples: Float32Array | null = null
   private sampleRate = 0
-
-  // 节拍检测
-  private energyHistory: number[] = []
-  private cooldownCounter = 0
-  private lastBeatIntensity = 0
-  private prevFluxSpectrum: number[] | null = null
 
   // 频谱渲染缓存
   private spectrumConfig: SpectrumConfig
@@ -46,6 +42,7 @@ export class OfflineCompositeRenderer {
     shakeX: 0, shakeY: 0, scale: 1, beatScaleTarget: 1,
     entranceProgress: 0, exitProgress: 0, isExiting: false,
     swayX: 0, swayY: 0, beatGlowEnergy: 0,
+    subtitleGlowEnergy: 0, // 字幕独立辉光能量，避免与边缘辉光互相干扰
   }
 
   constructor(
@@ -64,7 +61,8 @@ export class OfflineCompositeRenderer {
     this.fluidCanvas.style.cssText = `position:fixed;top:0;left:0;width:${width}px;height:${height}px;opacity:0;pointer-events:none`
     document.body.appendChild(this.fluidCanvas)
 
-    this.fft = new FftAnalyzer(256)
+    this.fft = new FftAnalyzer(1024)
+    this.beatDetector = new BeatDetector()
 
     this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true)
     this.fluidEngine.setDimensions(width, height)
@@ -80,6 +78,8 @@ export class OfflineCompositeRenderer {
     this.spectrumConfig = { ...spectrumConfig }
     this.subtitleConfig = { ...subtitleConfig }
     this.lyrics = lyrics
+
+    console.log('[OfflineComposite] beatEdgeEnabled =', this.fluidEngine.config.beatEdgeEnabled, 'config =', JSON.stringify(visualizerConfig))
   }
 
   setAudioData(samples: Float32Array, sampleRate: number): void {
@@ -89,17 +89,14 @@ export class OfflineCompositeRenderer {
 
   reset(): void {
     this.fluidEngine.resetState()
-    this.energyHistory = []
-    this.cooldownCounter = 0
-    this.lastBeatIntensity = 0
-    this.prevFluxSpectrum = null
-    this._prevFreqSmooth = null
+    this.beatDetector.reset()
     this.rotatingHue = this.spectrumConfig.hue
     this.animState = {
       posX: 0, posY: 0, targetX: 0, targetY: 0,
       shakeX: 0, shakeY: 0, scale: 1, beatScaleTarget: 1,
       entranceProgress: 0, exitProgress: 0, isExiting: false,
       swayX: 0, swayY: 0, beatGlowEnergy: 0,
+      subtitleGlowEnergy: 0,
     }
   }
 
@@ -111,13 +108,22 @@ export class OfflineCompositeRenderer {
     }
   }
 
+  /** 预注入初始 splat 使流体快速可见（用于导出预热后） */
+  primeFluid(): void {
+    for (let i = 0; i < 3; i++) {
+      // 用中等能量注入几波 splat，加速染料积累
+      this.fluidEngine.triggerRandomSplat(8 + i * 4)
+      this.fluidEngine.offlineStep(0.033, null, { isBeat: false, intensity: 0 })
+    }
+  }
+
   /**
    * 渲染一帧完整画面
    * @returns RGBA 像素数据 (Uint8ClampedArray)
    */
   renderFrame(timeSeconds: number, dt: number): Uint8ClampedArray {
     const spectrum = this.computeSpectrum(timeSeconds)
-    const beat = this.detectBeat(spectrum)
+    const beat = spectrum ? this.beatDetector.detect(spectrum) : { isBeat: false, intensity: 0 }
 
 
 
@@ -158,7 +164,7 @@ export class OfflineCompositeRenderer {
 
     // 第3层：频谱可视化
     if (this.spectrumConfig.enabled && spectrum) {
-      this.renderSpectrum(spectrum)
+      this.renderSpectrum(spectrum, timeSeconds)
     }
 
     // 第4层：字幕
@@ -167,45 +173,55 @@ export class OfflineCompositeRenderer {
     }
 
     // 边缘鼓点辉光（匹配预览效果）
-    if (this.fluidEngine.config.beatEdgeEnabled) {
+    const beatEdgeOn = this.fluidEngine.config.beatEdgeEnabled
+    if (beatEdgeOn) {
       // Update beat glow energy with smoothing
       if (beat.isBeat && beat.intensity > 0.05) {
-        this.animState.beatGlowEnergy = Math.max(
-          beat.intensity,
-          this.animState.beatGlowEnergy * 0.15 + beat.intensity * 0.85,
-        )
+        // 与预览一致：鼓点瞬间拉到较高能量，确保边缘辉光明显可见
+        this.animState.beatGlowEnergy = Math.max(0.65, beat.intensity * 1.3)
+        if (timeSeconds < 2) console.log('[BeatEdge] BEAT', timeSeconds.toFixed(3), 'intensity', beat.intensity.toFixed(3), '-> glowEnergy', this.animState.beatGlowEnergy.toFixed(3))
       }
-      this.animState.beatGlowEnergy *= 0.84
+      this.animState.beatGlowEnergy *= 0.85
       if (this.animState.beatGlowEnergy < 0.003) this.animState.beatGlowEnergy = 0
       this.renderBeatEdgeGlow()
+    } else {
+      if (timeSeconds < 0.1) console.log('[BeatEdge] beatEdgeEnabled is FALSE in fluidEngine.config')
     }
 
-    return ctx.getImageData(0, 0, w, h).data
+    const result = ctx.getImageData(0, 0, w, h).data
+
+    if (!(this as any)._pxChk && this.animState.beatGlowEnergy > 0.5) {
+      (this as any)._pxChk = true
+      const topPixel = ctx.getImageData(w / 2, 10, 1, 1).data
+      const edgePixel = ctx.getImageData(5, h / 2, 1, 1).data
+      console.log('[BeatEdge] Pixel check: top-center=', Array.from(topPixel), 'left-mid=', Array.from(edgePixel))
+    }
+
+    return result
   }
 
   // ========== 频谱计算 ==========
-
-  // 缓存的上一帧频谱，用于时间平滑（与 Web Audio API smoothingTimeConstant=0.35 对齐）
-  private _prevFreqSmooth: Float32Array | null = null
 
   private computeSpectrum(timeSeconds: number): SpectrumData | null {
     if (!this.samples || this.sampleRate === 0) return null
 
     const sampleIndex = Math.floor(timeSeconds * this.sampleRate)
-    const fftMag = this.fft.analyzeWindow(this.samples, Math.max(0, sampleIndex - 128), 256)
-
-    // dB 缩放 + 映射到 0-255，模拟 Web Audio API AnalyserNode.getByteFrequencyData
-    // Web Audio API 默认：minDecibels=-100, maxDecibels=-30，映射 [-100dB, -30dB] → [0, 255]
-    // 必须与预览一致，否则流体强度会明显不同
-    const MIN_DB = -100
-    const MAX_DB = -30
+    // 与预览 AudioEngine 的 AnalyserNode 对齐：
+    // - FFT 1024 → 512 bins (AnalyserNode.fftSize = 1024)
+    // - dB 范围 [-80, -10] (match analyser.minDecibels/maxDecibels)
+    // - smoothingTimeConstant = 0 (无帧间平滑)
+    // - 单窗口 FFT，不做多窗口 max-pooling（避免能量膨胀）
+    const FFT_SIZE = 1024
+    const HALF_SIZE = FFT_SIZE / 2 // 512 bins, matches AudioEngine
+    const MIN_DB = -80
+    const MAX_DB = -10
     const dbRange = MAX_DB - MIN_DB
 
-    const freqData = new Uint8Array(128)
-    const rawSmooth = new Float32Array(128)
-    const smoothingFactor = 0.35 // 与 Web Audio API smoothingTimeConstant 对齐
+    const offset = Math.max(0, sampleIndex - HALF_SIZE)
+    const fftMag = this.fft.analyzeWindow(this.samples, offset, FFT_SIZE)
 
-    for (let i = 0; i < 128; i++) {
+    const freqData = new Uint8Array(HALF_SIZE)
+    for (let i = 0; i < HALF_SIZE; i++) {
       const mag = fftMag[i]
       let db: number
       if (mag <= 1e-10) {
@@ -213,86 +229,65 @@ export class OfflineCompositeRenderer {
       } else {
         db = 20 * Math.log10(mag)
       }
-      // 映射 dB 到 0-255
       const linear = Math.max(0, Math.min(255, Math.round(((db - MIN_DB) / dbRange) * 255)))
-      rawSmooth[i] = linear
-
-      // 时间平滑（模拟 AnalyserNode 的 smoothingTimeConstant）
-      if (this._prevFreqSmooth && this._prevFreqSmooth.length === 128) {
-        const smoothed = this._prevFreqSmooth[i] + (linear - this._prevFreqSmooth[i]) * smoothingFactor
-        freqData[i] = Math.min(255, Math.round(smoothed))
-      } else {
-        freqData[i] = linear
-      }
+      freqData[i] = linear
     }
-    this._prevFreqSmooth = rawSmooth
 
-    const waveData = new Uint8Array(128)
-    for (let i = 0; i < 128; i++) {
-      const idx = Math.max(0, sampleIndex - 64 + i)
+    // 时域波形（512 点，与 AudioEngine 对齐）
+    const waveData = new Uint8Array(HALF_SIZE)
+    for (let i = 0; i < HALF_SIZE; i++) {
+      const idx = Math.max(0, sampleIndex - HALF_SIZE / 2 + i)
       if (idx < this.samples.length) {
         waveData[i] = Math.min(255, Math.floor(((this.samples[idx] + 1) / 2) * 255))
       }
     }
+
+    // 平均能量 (0-1)，与 AudioEngine.getSpectrumData 计算方式一致
     let sum = 0
     for (let i = 0; i < freqData.length; i++) sum += freqData[i]
     const averageEnergy = sum / (freqData.length * 255)
-    const bassBins = Math.floor(freqData.length / 4)
+
+    // 低频能量 (bassEnergy)：前 24 bin ≈ 0-1032 Hz @ 44100 Hz，与 AudioEngine 完全对齐
+    // AnalyserNode: fftSize=1024 → 512 bin，bin 宽度 22050/512 ≈ 43 Hz
+    // bin 0-23 ≈ 0-1032 Hz，覆盖底鼓+军鼓频段
+    const bassBins = Math.min(24, freqData.length)
     let bassSum = 0
     for (let i = 0; i < bassBins; i++) bassSum += freqData[i]
     const bassEnergy = bassSum / (bassBins * 255)
-    return { frequency: freqData, waveform: waveData, averageEnergy, bassEnergy }
+
+    // drumEnergy: bin 1-10 ≈ 43-430 Hz (kick: 40-100Hz, snare: 200-500Hz, toms: 100-300Hz)
+    const drumStart = 1
+    const drumEnd = Math.min(10, freqData.length - 1)
+    let drumSum = 0
+    const drumCount = drumEnd - drumStart + 1
+    for (let i = drumStart; i <= drumEnd; i++) drumSum += freqData[i]
+    const drumEnergy = drumSum / (drumCount * 255)
+
+    // melodicEnergy: bin 11+ (430 Hz+)，人声/乐器/和声
+    const melodicStart = Math.min(11, freqData.length - 1)
+    const melodicEnd = freqData.length - 1
+    let melodicEnergy = 0
+    if (melodicEnd > melodicStart) {
+      let melodicSum = 0
+      const melodicCount = melodicEnd - melodicStart + 1
+      for (let i = melodicStart; i <= melodicEnd; i++) melodicSum += freqData[i]
+      melodicEnergy = melodicSum / (melodicCount * 255)
+    }
+
+    // 每秒打印一次能量统计，方便对比预览
+    if (!(this as any)._lastEnergyLog || timeSeconds - (this as any)._lastEnergyLog > 1) {
+      (this as any)._lastEnergyLog = timeSeconds
+      console.log('[Spectrum] t=' + timeSeconds.toFixed(1) + 's avgE=' + averageEnergy.toFixed(3) + ' bassE=' + bassEnergy.toFixed(3) + ' drumE=' + drumEnergy.toFixed(3) + ' melE=' + melodicEnergy.toFixed(3))
+    }
+
+    return { frequency: freqData, waveform: waveData, averageEnergy, bassEnergy, drumEnergy, melodicEnergy }
   }
 
-  // ========== 节拍检测 ==========
-
-  private detectBeat(spectrum: SpectrumData | null): BeatResult {
-    if (!spectrum) {
-      this.prevFluxSpectrum = null
-      this.lastBeatIntensity *= 0.9
-      return { isBeat: false, intensity: this.lastBeatIntensity }
-    }
-    const subBassBins = Math.min(2, spectrum.frequency.length)
-    let subBassSum = 0
-    for (let i = 0; i < subBassBins; i++) subBassSum += spectrum.frequency[i]
-    const subBassEnergy = subBassSum / (subBassBins * 255)
-    let spectralFlux = 0
-    if (this.prevFluxSpectrum && this.prevFluxSpectrum.length === spectrum.frequency.length) {
-      let fluxSum = 0
-      for (let i = 0; i < spectrum.frequency.length; i++) {
-        const diff = spectrum.frequency[i] - this.prevFluxSpectrum[i]
-        if (diff > 0) fluxSum += diff
-      }
-      spectralFlux = fluxSum / (spectrum.frequency.length * 255)
-    }
-    this.prevFluxSpectrum = Array.from(spectrum.frequency)
-    const combinedEnergy = subBassEnergy * 0.6 + spectrum.averageEnergy * 0.4
-    this.energyHistory.push(combinedEnergy)
-    if (this.energyHistory.length > 60) this.energyHistory.shift()
-    if (this.cooldownCounter > 0) this.cooldownCounter--
-    const avg = this.energyHistory.length > 0
-      ? this.energyHistory.reduce((a, b) => a + b, 0) / this.energyHistory.length
-      : 0
-    const isBeat =
-      this.cooldownCounter === 0 &&
-      this.energyHistory.length >= 10 &&
-      combinedEnergy > avg * 1.35 &&
-      combinedEnergy > 0.12 &&
-      (subBassEnergy > 0.08 || spectralFlux > 0.06)
-    if (isBeat) {
-      this.cooldownCounter = 10
-      const energyStrength = Math.min(1, (combinedEnergy - avg * 1.35) / (1 - avg * 1.35))
-      const fluxStrength = Math.min(1, spectralFlux * 5)
-      this.lastBeatIntensity = Math.min(1, Math.max(0.15, energyStrength * 0.6 + fluxStrength * 0.4))
-      return { isBeat: true, intensity: this.lastBeatIntensity }
-    }
-    this.lastBeatIntensity *= 0.88
-    return { isBeat: false, intensity: this.lastBeatIntensity }
-  }
+  // ========== 节拍检测（使用 BeatDetector，与预览完全一致）==========
 
   // ========== 频谱渲染 ==========
 
-  private renderSpectrum(spectrum: SpectrumData): void {
+  private renderSpectrum(spectrum: SpectrumData, timeSeconds: number): void {
     const ctx = this.ctx2d
     const w = this.width
     const h = this.height
@@ -304,7 +299,7 @@ export class OfflineCompositeRenderer {
       case 'circular': this.renderCircular(ctx, w, h, freq, cfg); break
       case 'wave': this.renderWave(ctx, w, h, freq, cfg); break
       case 'mirror': this.renderMirror(ctx, w, h, freq, cfg); break
-      case 'dots': this.renderDots(ctx, w, h, freq, cfg); break
+      case 'dots': this.renderDots(ctx, w, h, freq, cfg, timeSeconds); break
       default: this.renderBars(ctx, w, h, freq, cfg)
     }
   }
@@ -503,13 +498,15 @@ export class OfflineCompositeRenderer {
   private renderDots(
     ctx: CanvasRenderingContext2D,
     w: number, h: number, freq: Uint8Array, cfg: SpectrumConfig,
+    timeSeconds: number,
   ): void {
     const count = cfg.barCount
     const binSize = Math.floor(freq.length / count)
     const maxRadius = Math.min(w, h) * 0.4
     const cx = w / 2
     const cy = h / 2
-    const time = performance.now()
+    // 使用音频时间戳，确保离线渲染可复现
+    const t = timeSeconds
 
     for (let i = 0; i < count; i++) {
       let sum = 0
@@ -520,7 +517,7 @@ export class OfflineCompositeRenderer {
       const boosted = this.applySensitivity(value)
       if (boosted < 0.02) continue
 
-      const angle = (i / count) * Math.PI * 6 + time * 0.0001
+      const angle = (i / count) * Math.PI * 6 + t * 0.1
       const dist = 0.08 + (i / count) * 0.35
       const x = cx + Math.cos(angle) * maxRadius * dist + (boosted - 0.5) * 20
       const y = cy + Math.sin(angle) * maxRadius * dist * 0.7 + (boosted - 0.5) * 20
@@ -598,11 +595,11 @@ export class OfflineCompositeRenderer {
     // 节拍缩放
     if (beat.isBeat) {
       as.beatScaleTarget = cfg.beatScale
-      as.beatGlowEnergy = beat.intensity
+      as.subtitleGlowEnergy = beat.intensity
     }
     as.beatScaleTarget += (1 - as.beatScaleTarget) * 0.15
     as.scale += (as.beatScaleTarget - as.scale) * 0.2
-    as.beatGlowEnergy *= 0.85
+    as.subtitleGlowEnergy *= 0.85
 
     // 抖动
     if (beat.isBeat) {
@@ -613,8 +610,8 @@ export class OfflineCompositeRenderer {
       as.shakeY *= 0.85
     }
 
-    // 摇曳
-    const t = performance.now() * 0.001 * cfg.driftSpeed
+    // 摇曳（使用音频时间戳，确保离线渲染可复现且严格跟随音频）
+    const t = timeSeconds * cfg.driftSpeed
     as.swayX = Math.sin(t * 1.3 + 0.5) * cfg.swayAmount
     as.swayY = Math.cos(t * 0.9 + 1.2) * cfg.swayAmount * 0.6
 
@@ -622,38 +619,30 @@ export class OfflineCompositeRenderer {
     as.posX += (as.targetX - as.posX) * 0.3
     as.posY += (as.targetY - as.posY) * 0.3
 
-    // 计算入场/出场变换
-    let entranceTransform = ''
-    let exitTransform = ''
+    // 入场/出场滑动偏移（在 Canvas 上直接应用，而非 CSS transform）
+    let slideOffsetX = 0
+    let slideOffsetY = 0
     const ep = as.entranceProgress
     const xp = as.exitProgress
-
-    // 入场效果
     const hasEntrance = (effect: string) => cfg.entranceEffect.includes(effect as any)
+    const hasExit = (effect: string) => cfg.exitEffect.includes(effect as any)
+
     if (ep < 1 && !as.isExiting) {
-      const ease = ep < 0.5 ? 2 * ep * ep : 1 - Math.pow(-2 * ep + 2, 2) / 2 // easeInOutQuad
+      const ease = ep < 0.5 ? 2 * ep * ep : 1 - Math.pow(-2 * ep + 2, 2) / 2
       const offset = (1 - ease) * 80
-      if (hasEntrance('fade')) { /* handled by opacity */ }
-      if (hasEntrance('slideUp')) entranceTransform += ` translateY(${offset}px)`
-      if (hasEntrance('slideDown')) entranceTransform += ` translateY(${-offset}px)`
-      if (hasEntrance('slideLeft')) entranceTransform += ` translateX(${offset}px)`
-      if (hasEntrance('slideRight')) entranceTransform += ` translateX(${-offset}px)`
-      if (hasEntrance('scale')) entranceTransform += ` scale(${0.3 + ease * 0.7})`
-      if (hasEntrance('blur')) { /* filter handled below */ }
+      if (hasEntrance('slideUp')) slideOffsetY = offset
+      if (hasEntrance('slideDown')) slideOffsetY = -offset
+      if (hasEntrance('slideLeft')) slideOffsetX = offset
+      if (hasEntrance('slideRight')) slideOffsetX = -offset
     }
 
-    // 出场效果
-    const hasExit = (effect: string) => cfg.exitEffect.includes(effect as any)
     if (xp > 0) {
       const ease = xp < 0.5 ? 2 * xp * xp : 1 - Math.pow(-2 * xp + 2, 2) / 2
       const offset = ease * 80
-      if (hasExit('fade')) { /* handled by opacity */ }
-      if (hasExit('slideUp')) exitTransform += ` translateY(${-offset}px)`
-      if (hasExit('slideDown')) exitTransform += ` translateY(${offset}px)`
-      if (hasExit('slideLeft')) exitTransform += ` translateX(${-offset}px)`
-      if (hasExit('slideRight')) exitTransform += ` translateX(${offset}px)`
-      if (hasExit('scale')) exitTransform += ` scale(${1 - ease * 0.7})`
-      if (hasExit('blur')) { /* filter handled below */ }
+      if (hasExit('slideUp')) slideOffsetY = -offset
+      if (hasExit('slideDown')) slideOffsetY = offset
+      if (hasExit('slideLeft')) slideOffsetX = -offset
+      if (hasExit('slideRight')) slideOffsetX = offset
     }
 
     // 计算透明度
@@ -672,32 +661,54 @@ export class OfflineCompositeRenderer {
     // 绘制
     ctx.save()
 
-    const drawX = as.posX + as.shakeX + as.swayX
-    const drawY = as.posY + as.shakeY + as.swayY
+    const drawX = as.posX + as.shakeX + as.swayX + slideOffsetX
+    const drawY = as.posY + as.shakeY + as.swayY + slideOffsetY
 
     ctx.translate(drawX, drawY)
-    ctx.scale(as.scale * (0.3 + ep * 0.7), as.scale * (0.3 + ep * 0.7))
 
-    const fontSize = cfg.fontSize
+    // 不缩放 ctx，而是直接调整字体大小，避免 Canvas 放大导致文字模糊
+    const entranceScale = (0.3 + ep * 0.7)
+    const effectiveScale = as.scale * entranceScale
+    const effectiveFontSize = Math.round(cfg.fontSize * effectiveScale)
     const maxWidth = (cfg.maxWidth / 100) * w
-    ctx.font = `${cfg.fontWeight} ${fontSize}px ${cfg.fontFamily === 'inherit' ? 'sans-serif' : cfg.fontFamily}`
+    ctx.font = `${cfg.fontWeight} ${effectiveFontSize}px ${cfg.fontFamily === 'inherit' ? 'sans-serif' : cfg.fontFamily}`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
-    ctx.letterSpacing = `${cfg.letterSpacing}em` as any
 
-    // 外发光 (text shadow)
+    // 多层辉光模拟 CSS text-shadow 效果（三层叠加，从大到小）
     if (cfg.glowSize > 0 && cfg.glowIntensity > 0) {
       const glowAlpha = cfg.glowIntensity * opacity
-      const beatGlow = as.beatGlowEnergy * 0.3
-      ctx.shadowColor = withAlpha(cfg.outerColor, glowAlpha + beatGlow)
-      ctx.shadowBlur = cfg.glowSize * (1 + as.beatGlowEnergy * 0.5)
+      const beatGlow = as.subtitleGlowEnergy * 0.3
+      const totalAlpha = glowAlpha + beatGlow
+      const baseGlow = cfg.glowSize * (1 + as.subtitleGlowEnergy * 0.5)
+      // 跟随流体色相动态调整 outerColor（与预览默认行为一致）
+      const dynamicOuterColor = `hsl(${this.fluidEngine.config.hue}, 100%, 60%)`
+
+      // 最外层：大模糊 + 低透明度，模拟 CSS 最外层辉光
+      ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha * 0.3)
+      ctx.shadowBlur = baseGlow * 1.5
+      ctx.fillStyle = withAlpha(dynamicOuterColor, totalAlpha * 0.15)
+      ctx.fillText(currentLyric.text, 0, 0, maxWidth)
+
+      // 中层：中等模糊
+      ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha * 0.5)
+      ctx.shadowBlur = baseGlow * 0.7
+      ctx.fillStyle = withAlpha(dynamicOuterColor, totalAlpha * 0.25)
+      ctx.fillText(currentLyric.text, 0, 0, maxWidth)
+
+      // 内层：紧凑辉光，接近文字本体
+      ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha)
+      ctx.shadowBlur = baseGlow * 0.3
     }
 
+    // 主文字层
     ctx.fillStyle = withAlpha(cfg.innerColor, opacity)
     ctx.fillText(currentLyric.text, 0, 0, maxWidth)
 
     ctx.restore()
     ctx.filter = 'none'
+    ctx.shadowColor = 'transparent'
+    ctx.shadowBlur = 0
   }
 
   // ========== 边缘鼓点辉光 ==========
@@ -709,10 +720,12 @@ export class OfflineCompositeRenderer {
     const energy = this.animState.beatGlowEnergy
     if (energy < 0.005) return
 
+    if (!(this as any)._bgd) { (this as any)._bgd = true; console.log('[BeatEdge] renderBeatEdgeGlow called, energy=' + energy.toFixed(4) + ' w=' + w + ' h=' + h) }
+
     const hue = this.fluidEngine.config.hue
     const eased = energy < 0.08 ? energy * 0.2 : 1 - Math.pow(1 - energy, 3)
     const alpha = Math.min(1, eased * 1.3)
-    const maxGlowWidth = Math.min(w, h) * 0.18
+    const maxGlowWidth = Math.min(w, h) * (this.fluidEngine.config.beatEdgeWidth ?? 0.12)
     const glowWidth = maxGlowWidth * eased
 
     ctx.save()

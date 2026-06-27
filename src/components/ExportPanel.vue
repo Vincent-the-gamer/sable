@@ -107,7 +107,7 @@ function resetDefaults() {
         encoder: "videotoolbox_h264",
         format: "mp4",
         crf: 23,
-        speedPreset: "ultrafast",
+        speedPreset: "balanced",
     };
     emitChange();
 }
