@@ -78,24 +78,33 @@ pub fn start_piped_export(
 
     match encoder {
         "videotoolbox_h264" => {
-            let quality = match speed_preset {
-                "quality" => 30,
-                "balanced" => 55,
-                "fast" => 75,
-                "superfast" => 85,
-                _ => 90,
+            // VideoToolbox 不支持 -q:v，需根据分辨率和帧率计算目标码率
+            let bpp = match speed_preset {
+                "quality" => 0.20,
+                "balanced" => 0.12,
+                "fast" => 0.07,
+                "superfast" => 0.04,
+                _ => 0.02,
             };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
+            let bitrate_str = bitrate.to_string();
             // VideoToolbox 需要 nv12 输入；用 -vf format=nv12 做显式格式转换
             // 避免 -pix_fmt（无流标识符）被错误应用到音频流导致 -22 (Invalid argument)
-            cmd.args([
+            let mut args = vec![
                 "-vf",
                 "format=nv12",
                 "-c:v",
                 "h264_videotoolbox",
-                "-q:v",
-                &quality.to_string(),
+                "-b:v",
+                &bitrate_str,
                 "-allow_sw",
                 "1",
+            ];
+            // 快速预设开启实时模式，降低延迟
+            if speed_preset == "superfast" || speed_preset == "ultrafast" {
+                args.extend_from_slice(&["-realtime", "1"]);
+            }
+            args.extend_from_slice(&[
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -104,26 +113,35 @@ pub fn start_piped_export(
                 "-movflags",
                 "+faststart",
             ]);
+            cmd.args(&args);
         }
         "videotoolbox_hevc" => {
-            let quality = match speed_preset {
-                "quality" => 30,
-                "balanced" => 55,
-                "fast" => 75,
-                "superfast" => 85,
-                _ => 90,
+            // HEVC 效率更高，码率约为 H.264 的 70%
+            let bpp = match speed_preset {
+                "quality" => 0.14,
+                "balanced" => 0.084,
+                "fast" => 0.049,
+                "superfast" => 0.028,
+                _ => 0.014,
             };
-            cmd.args([
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
+            let bitrate_str = bitrate.to_string();
+            let mut args = vec![
                 "-vf",
                 "format=nv12",
                 "-c:v",
                 "hevc_videotoolbox",
-                "-q:v",
-                &quality.to_string(),
+                "-b:v",
+                &bitrate_str,
                 "-allow_sw",
                 "1",
                 "-tag:v",
                 "hvc1",
+            ];
+            if speed_preset == "superfast" || speed_preset == "ultrafast" {
+                args.extend_from_slice(&["-realtime", "1"]);
+            }
+            args.extend_from_slice(&[
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -132,6 +150,7 @@ pub fn start_piped_export(
                 "-movflags",
                 "+faststart",
             ]);
+            cmd.args(&args);
         }
         "software_vp9" => {
             let (cpu_used, deadline) = match speed_preset {

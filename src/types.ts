@@ -265,6 +265,6 @@ export interface ExportSettings {
   format: 'mp4' | 'webm'
   /** CRF 质量 (0-51, 越小质量越高, 仅软件编码器) */
   crf: number
-  /** 编码速度预设 (仅软件编码器) */
+  /** 编码速度预设 (硬件编码器控制码率，软件编码器控制 preset/CRF) */
   speedPreset: SpeedPreset
 }

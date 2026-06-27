@@ -1063,6 +1063,9 @@ export class WebGLFluidEngine {
    * 调用后可用 captureFrame() 获取像素
    */
   offlineStep(dt: number, spectrum: SpectrumData | null, beat: BeatResult): void {
+    // 累计模拟时间（与 start() 循环保持一致的驱动逻辑）
+    this.time += dt
+
     // 动态色相旋转
     if (this.config.hueRotate) {
       const speed = this.config.hueRotateSpeed ?? 1.0
@@ -1090,9 +1093,8 @@ export class WebGLFluidEngine {
     // 模拟步进
     this.step(dt, this.currentAudioEnergy)
 
-    // Render to canvas default FB + displayFBO
+    // 渲染到 displayFBO（captureFrame 从 displayFBO 读取）
     if (this.displayWidth > 0 && this.displayHeight > 0) {
-      this.renderDisplay(null)
       this.renderDisplay(this.displayFBO.fbo)
     }
   }

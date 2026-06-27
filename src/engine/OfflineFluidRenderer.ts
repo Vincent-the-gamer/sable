@@ -55,6 +55,7 @@ export class OfflineFluidRenderer {
     this.lastBeatIntensity = 0
     this.smoothedEnergy = 0
     this.prevFluxSpectrum = null
+    this._prevFreqSmooth = null
   }
 
   /** 更新配置 */
@@ -89,6 +90,9 @@ export class OfflineFluidRenderer {
 
   // ========== 频谱计算 ==========
 
+  // 缓存的上一帧频谱，用于时间平滑（与 Web Audio API smoothingTimeConstant=0.35 对齐）
+  private _prevFreqSmooth: Float32Array | null = null
+
   private computeSpectrum(timeSeconds: number): SpectrumData | null {
     if (!this.samples || this.sampleRate === 0) {
       // 无音频数据时返回空频谱（引擎会以零能量运行）
@@ -103,10 +107,39 @@ export class OfflineFluidRenderer {
       Math.max(0, sampleIndex - 128),
       256,
     )
+
+    // dB 缩放 + 映射到 0-255，模拟 Web Audio API AnalyserNode.getByteFrequencyData
+    // Web Audio API 默认：minDecibels=-100, maxDecibels=-30，映射 [-100dB, -30dB] → [0, 255]
+    // 必须与预览一致，否则流体强度会明显不同
+    const MIN_DB = -100
+    const MAX_DB = -30
+    const dbRange = MAX_DB - MIN_DB
+
     const freqData = new Uint8Array(128)
+    const rawSmooth = new Float32Array(128)
+    const smoothingFactor = 0.35 // 与 Web Audio API smoothingTimeConstant 对齐
+
     for (let i = 0; i < 128; i++) {
-      freqData[i] = Math.min(255, Math.floor(fftMag[i] * 255 * 3))
+      const mag = fftMag[i]
+      let db: number
+      if (mag <= 1e-10) {
+        db = -120
+      } else {
+        db = 20 * Math.log10(mag)
+      }
+      // 映射 dB 到 0-255
+      const linear = Math.max(0, Math.min(255, Math.round(((db - MIN_DB) / dbRange) * 255)))
+      rawSmooth[i] = linear
+
+      // 时间平滑（模拟 AnalyserNode 的 smoothingTimeConstant）
+      if (this._prevFreqSmooth && this._prevFreqSmooth.length === 128) {
+        const smoothed = this._prevFreqSmooth[i] + (linear - this._prevFreqSmooth[i]) * smoothingFactor
+        freqData[i] = Math.min(255, Math.round(smoothed))
+      } else {
+        freqData[i] = linear
+      }
     }
+    this._prevFreqSmooth = rawSmooth
 
     // 时域波形
     const waveData = new Uint8Array(128)
