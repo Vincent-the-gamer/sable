@@ -2370,6 +2370,38 @@ input[type="range"]::-webkit-slider-thumb:hover {
     opacity: 0.5;
 }
 
+.lyric-mode-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 10px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+    flex: 1;
+}
+.lyric-mode-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.14);
+}
+.lyric-mode-btn.active {
+    border-color: #a855f7;
+    background: rgba(168, 85, 247, 0.08);
+}
+.lyric-mode-label {
+    font-size: 13px;
+    font-weight: 500;
+}
+.lyric-mode-desc {
+    font-size: 11px;
+    opacity: 0.5;
+}
+
 .encoder-list {
     display: flex;
     flex-direction: column;

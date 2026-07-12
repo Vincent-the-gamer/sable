@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 import type { ExportSettings } from "../types";
+import { ENCODER_OPTIONS } from "../types";
 
 const props = defineProps<{
     settings: ExportSettings;
@@ -50,6 +51,53 @@ const fpsOptions = [24, 30, 60];
 
 function setFps(fps: number) {
     local.value.fps = fps;
+    emitChange();
+}
+
+// ═══ Encoder ═══
+const groupedEncoders = computed(() => {
+    const groups: { label: string; options: typeof ENCODER_OPTIONS }[] = [
+        {
+            label: "macOS",
+            options: ENCODER_OPTIONS.filter((o) => o.platform === "macOS"),
+        },
+        {
+            label: "NVIDIA",
+            options: ENCODER_OPTIONS.filter(
+                (o) =>
+                    o.platform === "Windows/Linux" &&
+                    o.label.startsWith("NVENC"),
+            ),
+        },
+        {
+            label: "AMD",
+            options: ENCODER_OPTIONS.filter(
+                (o) =>
+                    o.platform === "Windows/Linux" && o.label.startsWith("AMF"),
+            ),
+        },
+        {
+            label: "Intel",
+            options: ENCODER_OPTIONS.filter(
+                (o) =>
+                    o.platform === "Windows/Linux" &&
+                    o.label.startsWith("QuickSync"),
+            ),
+        },
+        {
+            label: "Linux VAAPI",
+            options: ENCODER_OPTIONS.filter((o) => o.platform === "Linux"),
+        },
+        {
+            label: "CPU",
+            options: ENCODER_OPTIONS.filter((o) => o.platform === "通用"),
+        },
+    ];
+    return groups.filter((g) => g.options.length > 0);
+});
+
+function setEncoder(encoder: string) {
+    local.value.encoder = encoder as ExportSettings["encoder"];
     emitChange();
 }
 
@@ -116,13 +164,13 @@ function resetDefaults() {
 <template>
     <div class="export-panel">
         <div class="panel-header">
-            <h3>📦 导出设置</h3>
-            <button class="reset-btn" @click="resetDefaults">默认</button>
+            <h3>Export Settings</h3>
+            <button class="reset-btn" @click="resetDefaults">Default</button>
         </div>
 
         <!-- Resolution -->
         <div class="section">
-            <span class="section-label">分辨率</span>
+            <span class="section-label">Resolution</span>
             <div class="preset-row">
                 <button
                     v-for="preset in resolutionPresets"
@@ -138,7 +186,7 @@ function resetDefaults() {
                     {{ preset.label }}
                 </button>
                 <button class="chip" :class="{ active: isCustomResolution }">
-                    自定义
+                    Custom
                 </button>
             </div>
             <div class="dim-row">
@@ -153,7 +201,7 @@ function resetDefaults() {
                     />
                     <span class="dim-suffix">W</span>
                 </div>
-                <span class="dim-sep">×</span>
+                <span class="dim-sep">x</span>
                 <div class="dim-input">
                     <input
                         type="number"
@@ -170,7 +218,7 @@ function resetDefaults() {
 
         <!-- FPS -->
         <div class="section">
-            <span class="section-label">帧率</span>
+            <span class="section-label">FPS</span>
             <div class="preset-row">
                 <button
                     v-for="fps in fpsOptions"
@@ -184,9 +232,29 @@ function resetDefaults() {
             </div>
         </div>
 
+        <!-- Encoder -->
+        <div class="section">
+            <span class="section-label">Encoder</span>
+            <template v-for="group in groupedEncoders" :key="group.label">
+                <span class="subsection-label">{{ group.label }}</span>
+                <div class="encoder-list">
+                    <button
+                        v-for="enc in group.options"
+                        :key="enc.value"
+                        class="encoder-btn"
+                        :class="{ active: local.encoder === enc.value }"
+                        @click="setEncoder(enc.value)"
+                    >
+                        <span class="encoder-name">{{ enc.label }}</span>
+                        <span class="encoder-desc">{{ enc.desc }}</span>
+                    </button>
+                </div>
+            </template>
+        </div>
+
         <!-- Format -->
         <div class="section">
-            <span class="section-label">输出格式</span>
+            <span class="section-label">Format</span>
             <div class="format-list">
                 <button
                     v-for="fmt in formatOptions"
@@ -204,7 +272,7 @@ function resetDefaults() {
         <!-- Quality -->
         <div class="section">
             <div class="quality-header">
-                <span class="section-label">画质</span>
+                <span class="section-label">Quality</span>
                 <span class="quality-badge" :class="'q-' + qualityLabel">{{
                     qualityLabel
                 }}</span>
@@ -218,26 +286,25 @@ function resetDefaults() {
                 @input="onCrfInput"
             />
             <div class="crf-labels">
-                <span>高画质</span>
+                <span>High</span>
                 <span>CRF: {{ local.crf }}</span>
-                <span>小体积</span>
+                <span>Small</span>
             </div>
         </div>
 
         <!-- Summary -->
         <div class="summary">
             <div class="summary-row">
-                <span>视频</span>
+                <span>Video</span>
                 <span
-                    >{{ local.width }}×{{ local.height }} @
+                    >{{ local.width }}x{{ local.height }} @
                     {{ local.fps }}fps</span
                 >
             </div>
             <div class="summary-row">
-                <span>格式</span>
+                <span>Format</span>
                 <span
-                    >{{ local.format.toUpperCase() }} /
-                    {{ qualityLabel }}画质</span
+                    >{{ local.format.toUpperCase() }} / {{ qualityLabel }}</span
                 >
             </div>
         </div>
@@ -297,6 +364,14 @@ function resetDefaults() {
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: rgba(255, 255, 255, 0.5);
+}
+
+.subsection-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: rgba(255, 255, 255, 0.3);
+    margin-top: 2px;
 }
 
 .preset-row {
@@ -408,6 +483,48 @@ function resetDefaults() {
 .format-desc {
     font-size: 11px;
     opacity: 0.5;
+}
+
+.encoder-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.encoder-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    padding: 8px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.02);
+    color: rgba(255, 255, 255, 0.55);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+}
+
+.encoder-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.encoder-btn.active {
+    border-color: #a855f7;
+    background: rgba(168, 85, 247, 0.1);
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.encoder-name {
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.encoder-desc {
+    font-size: 10px;
+    opacity: 0.45;
 }
 
 .quality-header {

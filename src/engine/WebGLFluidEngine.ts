@@ -1076,6 +1076,29 @@ export class WebGLFluidEngine {
   }
 
   /**
+   * Composite displayFBO content to the canvas default framebuffer,
+   * so drawImage(canvas) can get fluid pixels without readPixels.
+   */
+  compositeToCanvas(): void {
+    const gl = this.gl
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.viewport(0, 0, this.displayWidth, this.displayHeight)
+    gl.clearColor(0.0, 0.0, 0.0, 1.0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+    gl.enable(gl.BLEND)
+    gl.useProgram(this.displayProgram)
+    this.setUniform2f(this.displayProgram, 'texelSize', 1.0 / this.displayWidth, 1.0 / this.displayHeight)
+    this.setTexture(this.displayProgram, 'uTexture', this.dye.read, 0)
+    this.setTexture(this.displayProgram, 'uBloom', this.bloom, 1)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer!)
+    gl.enableVertexAttribArray(0)
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+    gl.drawArrays(gl.TRIANGLE_FAN, 0, 4)
+    gl.disable(gl.BLEND)
+  }
+
+  /**
    * 离线渲染一帧：注入音频 splats → 模拟步进 → 渲染显示
    * 调用后可用 captureFrame() 获取像素
    */
@@ -1116,6 +1139,7 @@ export class WebGLFluidEngine {
     // 渲染到 displayFBO（captureFrame 从 displayFBO 读取）
     if (this.displayWidth > 0 && this.displayHeight > 0) {
       this.renderDisplay(this.displayFBO.fbo)
+      this.compositeToCanvas()
     }
   }
 

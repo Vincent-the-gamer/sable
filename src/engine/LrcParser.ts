@@ -110,6 +110,29 @@ export class LrcParser {
   }
 
   /**
+   * 将 LyricLine 数组转换为 LRC 格式文本
+   */
+  static toLrc(lyrics: LyricLine[]): string {
+    const lines: string[] = []
+
+    for (const lyric of lyrics) {
+      const time = this.formatLrcTime(lyric.startTime)
+      lines.push(`[${time}]${lyric.text}`)
+    }
+
+    return lines.join('\n')
+  }
+
+  /**
+   * 格式化 LRC 时间戳: mm:ss.xx
+   */
+  private static formatLrcTime(seconds: number): string {
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return `${m.toString().padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`
+  }
+
+  /**
    * 格式化 SRT 时间戳: HH:MM:SS,mmm
    */
   private static formatSrtTime(seconds: number): string {

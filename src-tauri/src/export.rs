@@ -79,21 +79,25 @@ pub fn start_piped_export(
     // 高质量色度缩放（对流体渐变内容非常重要）
     cmd.args(["-sws_flags", "lanczos+accurate_rnd+full_chroma_int"]);
 
+    // ═══ 通用参数：码率计算 + 色度缩放（对所有硬件编码器生效） ═══
+    let bpp_quality = 0.45;
+    let bpp_balanced = 0.30;
+    let bpp_fast = 0.18;
+    let bpp_superfast = 0.12;
+    let bpp_ultrafast = 0.08;
+
     match encoder {
+        // ─── macOS: VideoToolbox ───
         "videotoolbox_h264" => {
-            // VideoToolbox 不支持 -q:v，需根据分辨率和帧率计算目标码率
-            // 流体渐变内容需要更高码率：bpp 比普通视频高 50%
             let bpp = match speed_preset {
-                "quality" => 0.45,
-                "balanced" => 0.30,
-                "fast" => 0.18,
-                "superfast" => 0.12,
-                _ => 0.08,
+                "quality" => bpp_quality,
+                "balanced" => bpp_balanced,
+                "fast" => bpp_fast,
+                "superfast" => bpp_superfast,
+                _ => bpp_ultrafast,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
             let bitrate_str = bitrate.to_string();
-            // VideoToolbox 需要 nv12 输入；用 -vf format=nv12 做显式格式转换
-            // 避免 -pix_fmt（无流标识符）被错误应用到音频流导致 -22 (Invalid argument)
             let mut args = vec![
                 "-vf",
                 "format=nv12",
@@ -103,8 +107,9 @@ pub fn start_piped_export(
                 &bitrate_str,
                 "-allow_sw",
                 "1",
+                "-pix_fmt:v",
+                "yuv420p",
             ];
-            // 快速预设开启实时模式，降低延迟
             if speed_preset == "superfast" || speed_preset == "ultrafast" {
                 args.extend_from_slice(&["-realtime", "1"]);
             }
@@ -120,7 +125,6 @@ pub fn start_piped_export(
             cmd.args(&args);
         }
         "videotoolbox_hevc" => {
-            // HEVC 效率更高，码率约为 H.264 的 70%
             let bpp = match speed_preset {
                 "quality" => 0.31,
                 "balanced" => 0.21,
@@ -141,6 +145,8 @@ pub fn start_piped_export(
                 "1",
                 "-tag:v",
                 "hvc1",
+                "-pix_fmt:v",
+                "yuv420p",
             ];
             if speed_preset == "superfast" || speed_preset == "ultrafast" {
                 args.extend_from_slice(&["-realtime", "1"]);
@@ -155,6 +161,280 @@ pub fn start_piped_export(
                 "+faststart",
             ]);
             cmd.args(&args);
+        }
+
+        // ─── NVIDIA: NVENC ───
+        "nvenc_h264" => {
+            let bpp = match speed_preset {
+                "quality" => bpp_quality,
+                "balanced" => bpp_balanced,
+                "fast" => bpp_fast,
+                "superfast" => bpp_superfast,
+                _ => bpp_ultrafast,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
+            let bitrate_str = bitrate.to_string();
+            let preset = match speed_preset {
+                "quality" => "p4",
+                "balanced" => "p3",
+                "fast" => "p2",
+                "superfast" => "p1",
+                _ => "p1",
+            };
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload_cuda",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                preset,
+                "-b:v",
+                &bitrate_str,
+                "-pix_fmt:v",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+        "nvenc_hevc" => {
+            let bpp = match speed_preset {
+                "quality" => 0.31,
+                "balanced" => 0.21,
+                "fast" => 0.13,
+                "superfast" => 0.08,
+                _ => 0.055,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
+            let bitrate_str = bitrate.to_string();
+            let preset = match speed_preset {
+                "quality" => "p4",
+                "balanced" => "p3",
+                "fast" => "p2",
+                "superfast" => "p1",
+                _ => "p1",
+            };
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload_cuda",
+                "-c:v",
+                "hevc_nvenc",
+                "-preset",
+                preset,
+                "-b:v",
+                &bitrate_str,
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt:v",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+
+        // ─── AMD: AMF ───
+        "amf_h264" => {
+            let bpp = match speed_preset {
+                "quality" => bpp_quality,
+                "balanced" => bpp_balanced,
+                "fast" => bpp_fast,
+                "superfast" => bpp_superfast,
+                _ => bpp_ultrafast,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
+            let bitrate_str = bitrate.to_string();
+            let quality = match speed_preset {
+                "quality" => "quality",
+                "balanced" => "balanced",
+                "fast" => "speed",
+                _ => "speed",
+            };
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_amf",
+                "-quality",
+                quality,
+                "-b:v",
+                &bitrate_str,
+                "-pix_fmt:v",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+        "amf_hevc" => {
+            let bpp = match speed_preset {
+                "quality" => 0.31,
+                "balanced" => 0.21,
+                "fast" => 0.13,
+                "superfast" => 0.08,
+                _ => 0.055,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
+            let bitrate_str = bitrate.to_string();
+            let quality = match speed_preset {
+                "quality" => "quality",
+                "balanced" => "balanced",
+                "fast" => "speed",
+                _ => "speed",
+            };
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "hevc_amf",
+                "-quality",
+                quality,
+                "-b:v",
+                &bitrate_str,
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt:v",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+
+        // ─── Intel: QuickSync ───
+        "qsv_h264" => {
+            let bpp = match speed_preset {
+                "quality" => bpp_quality,
+                "balanced" => bpp_balanced,
+                "fast" => bpp_fast,
+                "superfast" => bpp_superfast,
+                _ => bpp_ultrafast,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
+            let bitrate_str = bitrate.to_string();
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload=extra_hw_frames=64",
+                "-c:v",
+                "h264_qsv",
+                "-b:v",
+                &bitrate_str,
+                "-pix_fmt:v",
+                "nv12",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+        "qsv_hevc" => {
+            let bpp = match speed_preset {
+                "quality" => 0.31,
+                "balanced" => 0.21,
+                "fast" => 0.13,
+                "superfast" => 0.08,
+                _ => 0.055,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
+            let bitrate_str = bitrate.to_string();
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload=extra_hw_frames=64",
+                "-c:v",
+                "hevc_qsv",
+                "-b:v",
+                &bitrate_str,
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt:v",
+                "nv12",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+
+        // ─── Linux: VAAPI ───
+        "vaapi_h264" => {
+            let bpp = match speed_preset {
+                "quality" => bpp_quality,
+                "balanced" => bpp_balanced,
+                "fast" => bpp_fast,
+                "superfast" => bpp_superfast,
+                _ => bpp_ultrafast,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
+            let bitrate_str = bitrate.to_string();
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-b:v",
+                &bitrate_str,
+                "-pix_fmt:v",
+                "vaapi",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
+        }
+        "vaapi_hevc" => {
+            let bpp = match speed_preset {
+                "quality" => 0.31,
+                "balanced" => 0.21,
+                "fast" => 0.13,
+                "superfast" => 0.08,
+                _ => 0.055,
+            };
+            let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
+            let bitrate_str = bitrate.to_string();
+            cmd.args([
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "hevc_vaapi",
+                "-b:v",
+                &bitrate_str,
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt:v",
+                "vaapi",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ]);
         }
         "software_vp9" => {
             let (cpu_used, deadline) = match speed_preset {
@@ -325,6 +605,36 @@ pub fn send_piped_chunk(
     }
 
     let bytes = base64_decode(base64_data)?;
+    export
+        .stdin
+        .write_all(&bytes)
+        .map_err(|e| format!("Pipe write failed: {e}"))?;
+
+    let _ = app.emit(
+        "export-progress",
+        serde_json::json!({
+            "current_frame": 0u32,
+            "total_frames": total_frames,
+            "percent": 0u32,
+            "stage": "rendering"
+        }),
+    );
+
+    Ok(())
+}
+
+/// Send a chunk of raw RGBA bytes from a temp file to ffmpeg
+pub fn send_piped_chunk_file(app: &AppHandle, path: &str, total_frames: u32) -> Result<(), String> {
+    let mut guard = PIPED_EXPORT.lock().unwrap();
+    let export = guard.as_mut().ok_or("Pipe not started")?;
+
+    if is_cancelled() {
+        return Err("Cancelled".into());
+    }
+
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Failed to read chunk file {path}: {e}"))?;
+
     export
         .stdin
         .write_all(&bytes)

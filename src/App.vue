@@ -319,15 +319,6 @@ function startExport() {
         stage: "decoding",
     };
 
-    // 生成 SRT 字幕文件（与视频同名 .srt）
-    if (lyrics.value.length > 0) {
-        const srtPath = exportVideoPath.value.replace(/\.[^.]+$/, ".srt");
-        const srtContent = LrcParser.toSrt(lyrics.value, duration.value);
-        invoke("write_file_text", { path: srtPath, content: srtContent })
-            .then(() => console.log("[App] SRT 字幕已生成:", srtPath))
-            .catch((e) => console.warn("[App] SRT 生成失败:", e));
-    }
-
     const { cancel, done } = ExportPipeline.startExport(
         loadedFilePath.value,
         exportVideoPath.value,

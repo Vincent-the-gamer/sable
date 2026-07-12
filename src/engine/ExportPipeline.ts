@@ -35,8 +35,7 @@ export interface ExportConfig {
 }
 
 /**
- * 视频导出管线：WebGL 流体 + 频谱 + 字幕 → base64 管道 → ffmpeg 直接编码
- * 无临时文件，帧数据流式送入 ffmpeg stdin
+ * Video export pipeline: WebGL fluid + spectrum + subtitles → ffmpeg pipe
  */
 export class ExportPipeline {
   static startExport(
@@ -49,7 +48,6 @@ export class ExportPipeline {
     drumStem?: { samples: Float32Array; sampleRate: number },
   ): { cancel: () => void; done: Promise<string> } {
     let unlistenProgress: UnlistenFn | null = null
-    let unlistenDone: UnlistenFn | null = null
     let unlistenError: UnlistenFn | null = null
     let cancelled = false
 
@@ -65,11 +63,6 @@ export class ExportPipeline {
         })
       }).then((fn) => { unlistenProgress = fn })
 
-      listen<string>('export-done', (event) => {
-        if (cancelled) return
-        resolve(event.payload)
-      }).then((fn) => { unlistenDone = fn })
-
       listen<string>('export-error', (event) => {
         if (cancelled) return
         reject(new Error(event.payload))
@@ -78,20 +71,18 @@ export class ExportPipeline {
       startExportFlow(
         audioFilePath, outputPath, exportConfig, exportSettings,
         ffmpegPath, onProgress, () => cancelled, drumStem,
-      ).catch(reject)
+      ).then(resolve).catch(reject)
     })
 
     const cancel = () => {
       cancelled = true
       invoke('cancel_video_export').catch(() => {})
       unlistenProgress?.()
-      unlistenDone?.()
       unlistenError?.()
     }
 
     done.finally(() => {
       unlistenProgress?.()
-      unlistenDone?.()
       unlistenError?.()
     })
 
@@ -108,27 +99,58 @@ async function startExportFlow(
   onProgress?: ProgressCallback,
   isCancelled?: () => boolean,
   drumStem?: { samples: Float32Array; sampleRate: number },
-): Promise<void> {
-  // 对齐到偶数：NV12 格式要求宽高为偶数，否则 VideoToolbox 硬编失败
+): Promise<string> {
   const width = (exportSettings.width + 1) & ~1
   const height = (exportSettings.height + 1) & ~1
   const fps = exportSettings.fps
   const frameDuration = 1.0 / fps
   const frameSize = width * height * 4
 
-  // ═══ 阶段 1: 解码 ═══
   onProgress?.({ currentFrame: 0, totalFrames: 0, percent: 0, stage: 'decoding' })
 
+  console.log('[Export] Decoding audio...')
   const audioData = await invoke<AudioDecodeResult>('decode_audio_for_export', { path: audioFilePath })
-  if (isCancelled?.()) return
+  if (isCancelled?.()) throw new Error('Cancelled')
 
   const pcmBytes = _b64dec(audioData.samples_base64)
   const pcmF32 = new Float32Array(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength))
   const totalFrames = Math.ceil(audioData.duration_secs * fps)
 
-  console.log(`[Export] ${audioData.duration_secs.toFixed(1)}s, ${totalFrames} 帧, ${width}x${height}`)
+  console.log(`[Export] ${audioData.duration_secs.toFixed(1)}s, ${totalFrames} frames, ${width}x${height}`)
 
-  // ═══ 阶段 2: 启动 ffmpeg 管道 ═══
+  // Create renderer and warm up BEFORE starting ffmpeg.
+  // This prevents ffmpeg -shortest from terminating early (before any video frames arrive)
+  // while the audio input has already been fully read.
+  console.log('[Export] Creating renderer...')
+  const renderer = new OfflineCompositeRenderer(
+    width, height,
+    exportConfig.visualizerConfig,
+    exportConfig.spectrumConfig,
+    exportConfig.subtitleConfig,
+    exportConfig.lyrics,
+  )
+  renderer.setAudioData(pcmF32, audioData.sample_rate)
+
+  if (drumStem) {
+    renderer.setDrumStem(drumStem.samples, drumStem.sampleRate)
+    console.log('[Export] Drum stem enabled')
+  }
+
+  const warmupFrames = Math.min(totalFrames, Math.ceil(0.3 * fps))
+  console.log(`[Export] Warming up ${warmupFrames} frames...`)
+  const warmupT0 = performance.now()
+  for (let i = 0; i < warmupFrames; i++) {
+    if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
+    renderer.renderFrame(i * frameDuration, frameDuration)
+  }
+  const warmupMs = (performance.now() - warmupT0).toFixed(1)
+  renderer.reset()
+  renderer.setAudioData(pcmF32, audioData.sample_rate)
+  if (drumStem) renderer.setDrumStem(drumStem.samples, drumStem.sampleRate)
+  console.log(`[Export] Warmup done: ${warmupFrames} frames in ${warmupMs}ms`)
+
+  // Start ffmpeg AFTER warmup so both audio+video inputs begin simultaneously
+  console.log('[Export] Starting ffmpeg pipe...')
   await invoke('start_piped_export', {
     outputPath,
     audioPath: audioFilePath,
@@ -139,55 +161,30 @@ async function startExportFlow(
     speedPreset: exportSettings.speedPreset ?? 'ultrafast',
     ffmpegPath: ffmpegPath || null,
   })
-  if (isCancelled?.()) return
+  if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
+  console.log('[Export] ffmpeg pipe started, rendering frames...')
 
-  // ═══ 阶段 3: 渲染 + 管道写入 ═══
-  const renderer = new OfflineCompositeRenderer(
-    width, height,
-    exportConfig.visualizerConfig,
-    exportConfig.spectrumConfig,
-    exportConfig.subtitleConfig,
-    exportConfig.lyrics,
-  )
-  renderer.setAudioData(pcmF32, audioData.sample_rate)
-
-  // 鼓点分轨：设置独立鼓音轨 PCM 数据，覆盖频谱中的 drumEnergy
-  if (drumStem) {
-    renderer.setDrumStem(drumStem.samples, drumStem.sampleRate)
-    console.log('[Export] 鼓点分轨已启用')
-  }
-
-  // 预热：预跑 ~0.3s 的帧以积累染料，避免开头空白
-  const warmupFrames = Math.min(totalFrames, Math.ceil(0.3 * fps))
-  for (let i = 0; i < warmupFrames; i++) {
-    if (isCancelled?.()) { renderer.destroy(); return }
-    renderer.renderFrame(i * frameDuration, frameDuration)
-  }
-  // 重置状态，从 t=0 开始正式渲染
-  renderer.reset()
-  renderer.setAudioData(pcmF32, audioData.sample_rate)
-  // 不再额外 primeFluid：预热阶段已积累染料，避免开头高亮突兀
-  console.log(`[Export] 预热完成: ${warmupFrames} 帧`)
-
-  // 批量发送：CHUNK 大小调整以减少 IPC 开销同时保持 UI 响应
-  // 480p: ~1.2MB/frame, CHUNK=12 → ~14MB/chunk
-  // 1080p: ~8MB/frame, CHUNK=4 → ~32MB/chunk
   const CHUNK = Math.max(1, Math.floor(20_000_000 / frameSize))
   const totalBufSize = CHUNK * frameSize
   let chunkBuf = new Uint8Array(totalBufSize)
   let cnt = 0
   const t0 = performance.now()
+  let totalBytesSent = 0
 
   for (let i = 0; i < totalFrames; i++) {
-    if (isCancelled?.()) { renderer.destroy(); return }
+    if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
 
     const pixels = renderer.renderFrame(i * frameDuration, frameDuration)
     chunkBuf.set(pixels, cnt * frameSize)
     cnt++
 
     if (cnt >= CHUNK || i === totalFrames - 1) {
+      const chunkBytes = chunkBuf.subarray(0, cnt * frameSize)
+      const b64 = _b64enc(chunkBytes)
+      totalBytesSent += chunkBytes.byteLength
+
       await invoke('send_piped_chunk', {
-        dataBase64: _b64enc(chunkBuf.subarray(0, cnt * frameSize)),
+        dataBase64: b64,
         totalFrames,
       })
       cnt = 0
@@ -195,24 +192,26 @@ async function startExportFlow(
       const pct = Math.round(((i + 1) / totalFrames) * 100)
       onProgress?.({ currentFrame: i + 1, totalFrames, percent: pct, stage: 'rendering' })
 
-      // 让出主线程给 UI 渲染，避免界面卡顿
+      // Yield to keep UI responsive
       await new Promise((r) => setTimeout(r, 0))
     }
   }
 
-  // 渲染完成，释放 GPU 资源
   renderer.destroy()
 
   const elapsed = ((performance.now() - t0) / 1000).toFixed(1)
   const avgMs = totalFrames > 0 ? ((performance.now() - t0) / totalFrames).toFixed(1) : '?'
-  console.log(`[Export] 渲染完成 ${elapsed}s, 平均 ${avgMs}ms/帧`)
+  const mbSent = (totalBytesSent / 1024 / 1024).toFixed(1)
+  console.log(`[Export] Render done ${elapsed}s, avg ${avgMs}ms/frame, ${mbSent}MB sent`)
 
-  if (isCancelled?.()) return
+  if (isCancelled?.()) throw new Error('Cancelled')
 
-  // ═══ 阶段 4: 关闭管道 ═══
   onProgress?.({ currentFrame: totalFrames, totalFrames, percent: 100, stage: 'encoding' })
+  console.log('[Export] Finishing ffmpeg encode...')
   await invoke('finish_piped_export')
-  console.log('[Export] 完成')
+  console.log('[Export] Done')
+
+  return outputPath
 }
 
 function _b64dec(b64: string): Uint8Array {

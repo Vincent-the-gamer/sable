@@ -238,14 +238,34 @@ export interface VisualizerConfig {
   }
 
 /** 编码器选项 */
-export type VideoEncoder = 'videotoolbox_h264' | 'videotoolbox_hevc' | 'software_x264' | 'software_x265' | 'software_vp9'
+export type VideoEncoder =
+  | 'videotoolbox_h264' | 'videotoolbox_hevc'  // macOS: Apple Silicon
+  | 'nvenc_h264' | 'nvenc_hevc'                // NVIDIA: NVENC
+  | 'amf_h264' | 'amf_hevc'                     // AMD: AMF
+  | 'qsv_h264' | 'qsv_hevc'                     // Intel: QuickSync
+  | 'vaapi_h264' | 'vaapi_hevc'                 // Linux: VAAPI
+  | 'software_x264' | 'software_x265' | 'software_vp9'  // 软编备选
 
-export const ENCODER_OPTIONS: { value: VideoEncoder; label: string; desc: string }[] = [
-  { value: 'videotoolbox_h264', label: 'VideoToolbox H.264', desc: '硬件加速 • 极速 • 兼容好' },
-  { value: 'videotoolbox_hevc', label: 'VideoToolbox HEVC', desc: '硬件加速 • 体积更小' },
-  { value: 'software_x264',  label: 'x264 (H.264)',      desc: '软编 • 兼容性最佳' },
-  { value: 'software_x265',  label: 'x265 (HEVC)',       desc: '软编 • 压缩率最高' },
-  { value: 'software_vp9',   label: 'VP9 (WebM)',        desc: '开放格式' },
+export const ENCODER_OPTIONS: { value: VideoEncoder; label: string; desc: string; platform?: string }[] = [
+  // ─── macOS ───
+  { value: 'videotoolbox_h264', label: 'VideoToolbox H.264', desc: ' 硬件加速 • 极速 • 兼容好', platform: 'macOS' },
+  { value: 'videotoolbox_hevc', label: 'VideoToolbox HEVC', desc: ' 硬件加速 • 体积更小', platform: 'macOS' },
+  // ─── NVIDIA ───
+  { value: 'nvenc_h264',        label: 'NVENC H.264',        desc: 'NVIDIA 硬件加速 • 极速', platform: 'Windows/Linux' },
+  { value: 'nvenc_hevc',        label: 'NVENC HEVC',         desc: 'NVIDIA 硬件加速 • 体积更小', platform: 'Windows/Linux' },
+  // ─── AMD ───
+  { value: 'amf_h264',          label: 'AMF H.264',          desc: 'AMD 硬件加速 • 极速', platform: 'Windows/Linux' },
+  { value: 'amf_hevc',          label: 'AMF HEVC',           desc: 'AMD 硬件加速 • 体积更小', platform: 'Windows/Linux' },
+  // ─── Intel ───
+  { value: 'qsv_h264',          label: 'QuickSync H.264',    desc: 'Intel 核显加速 • 极速', platform: 'Windows/Linux' },
+  { value: 'qsv_hevc',          label: 'QuickSync HEVC',     desc: 'Intel 核显加速 • 体积更小', platform: 'Windows/Linux' },
+  // ─── Linux VAAPI ───
+  { value: 'vaapi_h264',        label: 'VAAPI H.264',        desc: 'Linux 通用硬加速 • 极速', platform: 'Linux' },
+  { value: 'vaapi_hevc',        label: 'VAAPI HEVC',         desc: 'Linux 通用硬加速 • 体积更小', platform: 'Linux' },
+  // ─── 软编备选 ───
+  { value: 'software_x264',     label: 'x264 (H.264)',       desc: 'CPU 软编 • 兼容性最佳', platform: '通用' },
+  { value: 'software_x265',     label: 'x265 (HEVC)',        desc: 'CPU 软编 • 压缩率最高', platform: '通用' },
+  { value: 'software_vp9',      label: 'VP9 (WebM)',         desc: '开放格式 • 体积更小', platform: '通用' },
 ]
 
 /** 编码速度预设 */
@@ -257,6 +277,13 @@ export const SPEED_PRESET_OPTIONS: { label: string; value: SpeedPreset; desc: st
   { label: '🚀 快速', value: 'fast', desc: '速度与质量兼顾' },
   { label: '⚖️ 均衡', value: 'balanced', desc: '推荐日常使用' },
   { label: '💎 高品质', value: 'quality', desc: '体积最小，速度较慢' },
+]
+
+/** 歌词导出模式 */
+export type LyricExportMode = 'embed'
+
+export const LYRIC_EXPORT_MODE_OPTIONS: { label: string; value: LyricExportMode; desc: string }[] = [
+  { label: '合并导出', value: 'embed', desc: '歌词嵌入视频画面' },
 ]
 
 /** 导出设置 */

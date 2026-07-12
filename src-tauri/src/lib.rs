@@ -104,6 +104,15 @@ fn send_piped_chunk(
 }
 
 #[tauri::command]
+fn send_piped_chunk_file(
+    app: tauri::AppHandle,
+    path: String,
+    total_frames: u32,
+) -> Result<(), String> {
+    export::send_piped_chunk_file(&app, &path, total_frames)
+}
+
+#[tauri::command]
 fn finish_piped_export(app: tauri::AppHandle) -> Result<(), String> {
     export::finish_piped_export(&app)
 }
@@ -155,6 +164,7 @@ pub fn run() {
             decode_audio_for_export,
             start_piped_export,
             send_piped_chunk,
+            send_piped_chunk_file,
             finish_piped_export,
             cancel_video_export,
         ])

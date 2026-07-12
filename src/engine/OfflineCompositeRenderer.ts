@@ -68,11 +68,9 @@ export class OfflineCompositeRenderer {
     this.fft = new FftAnalyzer(1024)
     this.beatDetector = new BeatDetector()
 
-    // 导出模式启用 3x 模拟质量倍率，匹配 Retina 大屏预览的清晰度
     this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 3.0)
     this.fluidEngine.setDimensions(width, height)
 
-    // 2D 合成画布（在流体之上绘制频谱和字幕），使用 DOM canvas 确保兼容
     this.compositeCanvas = document.createElement('canvas')
     this.compositeCanvas.width = width
     this.compositeCanvas.height = height
@@ -123,7 +121,6 @@ export class OfflineCompositeRenderer {
   /** 预注入初始 splat 使流体快速可见（用于导出预热后） */
   primeFluid(): void {
     for (let i = 0; i < 3; i++) {
-      // 用中等能量注入几波 splat，加速染料积累
       this.fluidEngine.triggerRandomSplat(8 + i * 4)
       this.fluidEngine.offlineStep(0.033, null, { isBeat: false, intensity: 0 })
     }
@@ -155,24 +152,14 @@ export class OfflineCompositeRenderer {
       }
     }
 
-    // 第1层：流体
+    // Layer 1: fluid (rendered to canvas via compositeToCanvas)
     this.fluidEngine.offlineStep(dt, spectrum, beat)
-    const fluidPixels = this.fluidEngine.captureFrame()
 
-    // Debug
-    if (timeSeconds < 0.2) {
-      let nz = 0
-      for (let i = 0; i < 100; i++) { if (fluidPixels[i] !== 0) nz++ }
-      console.log(`[Composite] t=${timeSeconds.toFixed(3)} nz=${nz} e=${spectrum?.averageEnergy?.toFixed(4) ?? 'null'}`)
-    }
-
-    // 第2层：在 2D canvas 上绘制流体
+    // Layer 2: draw fluid onto composite canvas directly (GPU→GPU, no CPU copy)
     const ctx = this.ctx2d
     const w = this.width
     const h = this.height
-    const imageData = ctx.createImageData(w, h)
-    imageData.data.set(fluidPixels)
-    ctx.putImageData(imageData, 0, 0)
+    ctx.drawImage(this.fluidCanvas, 0, 0, w, h)
 
     // 第3层：频谱可视化
     if (this.spectrumConfig.enabled && spectrum) {
@@ -187,9 +174,7 @@ export class OfflineCompositeRenderer {
     // 边缘鼓点辉光（匹配预览效果）
     const beatEdgeOn = this.fluidEngine.config.beatEdgeEnabled
     if (beatEdgeOn) {
-      // Update beat glow energy with smoothing
       if (beat.isBeat && beat.intensity > 0.05) {
-        // 与预览一致：鼓点瞬间拉到较高能量，确保边缘辉光明显可见
         this.animState.beatGlowEnergy = Math.max(0.65, beat.intensity * 1.3)
         if (timeSeconds < 2) console.log('[BeatEdge] BEAT', timeSeconds.toFixed(3), 'intensity', beat.intensity.toFixed(3), '-> glowEnergy', this.animState.beatGlowEnergy.toFixed(3))
       }
