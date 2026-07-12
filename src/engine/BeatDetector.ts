@@ -4,7 +4,8 @@ import type { BeatResult, SpectrumData } from '../types'
  * 节拍检测器：drumEnergy 导数峰值检测
  *
  * 原理：
- * drumEnergy (bin 1-10, 43-430 Hz) 来自 AudioEngine 频域分离。
+ * drumEnergy (bin 1-3, 43-172 Hz) 来自 AudioEngine 频域分离。
+ * 精确聚焦 kick/snare 低端，排除 bass 吉他/合成器 bleed。
  * kick/snare → drumEnergy 瞬间从 0.02 跳到 0.30（大正差分）
  * bass 音符 → drumEnergy 从 0.05 渐变到 0.10（小正差分）
  *
@@ -15,7 +16,7 @@ export class BeatDetector {
   private readonly DERIV_HISTORY = 40
 
   /** 导数阈值系数 */
-  private readonly PEAK_RATIO = 2.5
+  private readonly PEAK_RATIO = 3.0
 
   private readonly BASE_COOLDOWN = 7
 
@@ -27,8 +28,13 @@ export class BeatDetector {
   private prevDrumEnergy = 0
   private smoothedDrumEnergy = 0
 
+  /** 鼓点分轨模式：用户提供了独立鼓音轨时，直接用能量阈值判断 */
+  private _stemMode = false
+
   get lastIntensity(): number { return this._lastIntensity }
   get drumLevel(): number { return this.smoothedDrumEnergy }
+  get stemMode(): boolean { return this._stemMode }
+  set stemMode(val: boolean) { this._stemMode = val }
 
   set sensitivity(val: number) {
     this._sensitivity = Math.max(0.3, Math.min(3.0, val))
@@ -38,6 +44,27 @@ export class BeatDetector {
   detect(spectrum: SpectrumData): BeatResult {
     const rawDrum = spectrum.drumEnergy ?? 0
     const s = this._sensitivity
+
+    // ═══ 鼓点分轨模式：纯鼓音轨，直接用能量阈值 ═══
+    if (this._stemMode) {
+      if (rawDrum > this.smoothedDrumEnergy) {
+        this.smoothedDrumEnergy = this.smoothedDrumEnergy * 0.1 + rawDrum * 0.9
+      } else {
+        this.smoothedDrumEnergy = this.smoothedDrumEnergy * 0.75 + rawDrum * 0.25
+      }
+      if (this.cooldownCounter > 0) this.cooldownCounter--
+
+      const energyThreshold = 0.22 / s
+      const isBeat = this.cooldownCounter === 0 && rawDrum > energyThreshold
+
+      if (isBeat) {
+        this.cooldownCounter = Math.max(2, Math.round(6 / s))
+        this._lastIntensity = Math.min(1, rawDrum / 0.8)
+        return { isBeat: true, intensity: this._lastIntensity }
+      }
+      this._lastIntensity *= 0.7
+      return { isBeat: false, intensity: this._lastIntensity }
+    }
 
     // ═══ 1. drumEnergy 一阶导数（正差分）═══
     const deriv = Math.max(0, rawDrum - this.prevDrumEnergy)
@@ -72,7 +99,7 @@ export class BeatDetector {
       this.cooldownCounter === 0 &&
       deriv > threshold &&
       deriv > 0.015 &&
-      rawDrum > 0.04  // drumEnergy 本身也要够高，过滤微弱噪声
+      rawDrum > 0.04
 
     if (isBeat) {
       this.cooldownCounter = Math.max(3, Math.round(this.BASE_COOLDOWN / s))

@@ -14,8 +14,8 @@ import type { SpectrumData, BeatResult, VisualizerConfig } from '../types'
 
 // ────────────────────────── 常量配置 ──────────────────────────
 // 内部模拟分辨率现在根据输出尺寸动态缩放，以保证小分辨率输出时也有高帧率
-const SIM_RESOLUTION_BASE = 128   // 基准值，对应 1080p 输出高度
-const DYE_RESOLUTION_BASE = 1024  // 基准值，对应 1080p 输出高度
+const SIM_RESOLUTION_BASE = 192   // 基准值，对应 1080p 输出高度
+const DYE_RESOLUTION_BASE = 1536  // 基准值，对应 1080p 输出高度
 const SIM_RESOLUTION_MIN = 64
 const DYE_RESOLUTION_MIN = 480
 
@@ -335,6 +335,8 @@ export class WebGLFluidEngine {
   // WebGL
   canvas: HTMLCanvasElement | OffscreenCanvas
   private gl: WebGLRenderingContext
+  /** 导出/离线模式：不从 DOM 读取尺寸，直接使用 canvas 像素尺寸 */
+  private isOffline = false
   private ext = {
     formatRGBA: null as { internalFormat: number; format: number } | null,
     formatRG: null as { internalFormat: number; format: number } | null,
@@ -406,9 +408,14 @@ export class WebGLFluidEngine {
   // Quad buffer
   private quadBuffer: WebGLBuffer | null = null
 
-  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, config: VisualizerConfig, preserveDrawing = false) {
+  /** 导出模式下的模拟质量倍率 (默认 1.0，导出建议 2.0) */
+  private simQualityMultiplier = 1.0
+
+  constructor(canvas: HTMLCanvasElement | OffscreenCanvas, config: VisualizerConfig, preserveDrawing = false, simQualityMultiplier = 1.0) {
     this.canvas = canvas
     this.config = { ...config }
+    this.simQualityMultiplier = Math.max(1.0, simQualityMultiplier)
+    this.isOffline = preserveDrawing
     this.applyConfig()
 
     // 尝试 WebGL2，回退到 WebGL1
@@ -650,7 +657,8 @@ export class WebGLFluidEngine {
     const filtering = this.ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST
 
     // 动态分辨率：根据输出高度缩放模拟精度，小输出 = 快渲染
-    const scale = this.displayHeight / 1080
+    // 导出模式通过 simQualityMultiplier 提高内部模拟精度，消除模糊
+    const scale = (this.displayHeight / 1080) * this.simQualityMultiplier
     const simResRaw = Math.max(SIM_RESOLUTION_MIN, Math.round(SIM_RESOLUTION_BASE * scale))
     const dyeResRaw = Math.max(DYE_RESOLUTION_MIN, Math.round(DYE_RESOLUTION_BASE * scale))
     const simRes = this.getResolution(simResRaw)
@@ -694,7 +702,7 @@ export class WebGLFluidEngine {
     const rgba = this.ext.formatRGBA!
     const filtering = this.ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST
 
-    const bloomBase = Math.max(128, Math.round(256 * (this.displayHeight / 1080)))
+    const bloomBase = Math.max(128, Math.round(256 * (this.displayHeight / 1080) * this.simQualityMultiplier))
     const res = this.getResolution(bloomBase)
     this.bloom = this.createFBO(res.width, res.height,
       rgba.internalFormat, rgba.format, texType, filtering)
@@ -973,23 +981,32 @@ export class WebGLFluidEngine {
   // ═══════════ 公共接口 ═══════════
 
   resize(): void {
-    // DOM canvas: use bounding rect
     if ('getBoundingClientRect' in this.canvas) {
-      const dpr = window.devicePixelRatio || 1
-      const rect = (this.canvas as HTMLCanvasElement).getBoundingClientRect()
-      let w = Math.floor(rect.width * dpr)
-      let h = Math.floor(rect.height * dpr)
-      // 如果 canvas 不在 DOM 中，getBoundingClientRect 返回 0×0
-      // 回退到 canvas.width / canvas.height（离线渲染场景）
-      if (w === 0 || h === 0) {
-        w = this.canvas.width
-        h = this.canvas.height
+      // 导出/离线模式：直接使用 canvas 像素尺寸，不要 DPR 缩放
+      if (this.isOffline) {
+        const w = this.canvas.width
+        const h = this.canvas.height
         if (w === 0 || h === 0) return
+        this.displayWidth = w
+        this.displayHeight = h
+      } else {
+        // 预览模式：DPR 缩放以保证 Retina 清晰度
+        const dpr = window.devicePixelRatio || 1
+        const rect = (this.canvas as HTMLCanvasElement).getBoundingClientRect()
+        let w = Math.floor(rect.width * dpr)
+        let h = Math.floor(rect.height * dpr)
+        // 如果 canvas 不在 DOM 中，getBoundingClientRect 返回 0×0
+        // 回退到 canvas.width / canvas.height（离线渲染场景）
+        if (w === 0 || h === 0) {
+          w = this.canvas.width
+          h = this.canvas.height
+          if (w === 0 || h === 0) return
+        }
+        this.displayWidth = w
+        this.displayHeight = h
+        this.canvas.width = w
+        this.canvas.height = h
       }
-      this.displayWidth = w
-      this.displayHeight = h
-      this.canvas.width = w
-      this.canvas.height = h
     }
     // OffscreenCanvas: already sized, just sync display dimensions
     else {
@@ -1286,23 +1303,23 @@ export class WebGLFluidEngine {
     const activityMul = this.config.fluidActivity ?? 1.0
     // 活跃度越低 → 阈值越高，避免低能量时也满屏
 
-    // ── 旋律能量：mid-high 频段驱动流体，鼓点低频专属边缘闪烁 ──
-    const melodicEnergy = spectrum.melodicEnergy ?? spectrum.averageEnergy
+    // ── 全频段能量驱动流体（鼓点已独立为边缘闪烁，流体不再需要避开低频）──
+    const fluidEnergy = spectrum.averageEnergy
 
-    // ═══ 全局能量层：基于旋律能量而非全频 ═══
-    if (melodicEnergy > 0.03) {
-      const globalSpread = Math.ceil(melodicEnergy * 5 * activityMul)
+    // ═══ 全局能量层 ═══
+    if (fluidEnergy > 0.03) {
+      const globalSpread = Math.ceil(fluidEnergy * 5 * activityMul)
       for (let i = 0; i < globalSpread; i++) {
         const gColor = this.generateColor()
-        const gBright = (0.03 + melodicEnergy * 0.6) * intensityMul
+        const gBright = (0.03 + fluidEnergy * 0.6) * intensityMul
         gColor[0] *= gBright
         gColor[1] *= gBright
         gColor[2] *= gBright
         this.pendingSplats.push({
           x: 0.1 + Math.random() * 0.8,
           y: 0.1 + Math.random() * 0.8,
-          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * melodicEnergy * 0.4,
-          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * melodicEnergy * 0.4,
+          dx: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * fluidEnergy * 0.4,
+          dy: (Math.random() - 0.5) * this.fluidConfig.SPLAT_FORCE * fluidEnergy * 0.4,
           color: gColor,
         })
       }
@@ -1317,8 +1334,7 @@ export class WebGLFluidEngine {
 
       if (bandEnergy < 0.008) continue
 
-      // 跳过鼓点频段（bin 0-10, ~0-430 Hz），这些频段专属边缘闪烁
-      if (binEnd <= 12) continue
+      // 全频段参与流体（鼓点已独立处理）
 
       const bp = this.bandPositions[b]
       const color = bp.color
@@ -1375,17 +1391,17 @@ export class WebGLFluidEngine {
       }
     }
 
-    // 全局随机散布（仅基于旋律能量）
-    if (melodicEnergy > 0.04) {
-      const scatterCount = Math.ceil(melodicEnergy * 10 * activityMul)
+    // 全局随机散布
+    if (fluidEnergy > 0.04) {
+      const scatterCount = Math.ceil(fluidEnergy * 10 * activityMul)
       for (let i = 0; i < scatterCount; i++) {
         const color = this.generateColor()
-        const brightness = (0.10 + melodicEnergy * 1.2) * intensityMul
+        const brightness = (0.10 + fluidEnergy * 1.2) * intensityMul
         color[0] *= brightness
         color[1] *= brightness
         color[2] *= brightness
         const angle = Math.random() * Math.PI * 2
-        const fm = this.fluidConfig.SPLAT_FORCE * melodicEnergy * 1.0
+        const fm = this.fluidConfig.SPLAT_FORCE * fluidEnergy * 1.0
         this.pendingSplats.push({
           x: Math.random(),
           y: Math.random(),
@@ -1396,7 +1412,7 @@ export class WebGLFluidEngine {
       }
     }
 
-    // ═══ 鼓点不主导流体：仅留极微弱痕迹，鼓点专属边缘闪烁 ═══
+    // ═══ 鼓点流体共鸣：鼓点发生时注入少量额外 splat ═══
     if (beat.isBeat && beat.intensity > 0.3 && spectrum.drumEnergy > 0.12) {
       const drumTraceCount = Math.ceil(beat.intensity * 4 * activityMul)
       for (let i = 0; i < drumTraceCount; i++) {

@@ -31,6 +31,17 @@ import { version } from "../package.json";
 type Page = "home" | "studio" | "settings" | "debug";
 const currentPage = ref<Page>("home");
 
+// Toast
+const toastMessage = ref("");
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+function showToast(msg: string) {
+    toastMessage.value = msg;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+        toastMessage.value = "";
+    }, 3000);
+}
+
 // ═══════════ Audio Engine ═══════════
 const audioEngine = new AudioEngine();
 const beatDetector = new BeatDetector();
@@ -47,6 +58,12 @@ const latestSpectrum = ref<SpectrumData | null>(null);
 const latestBeat = ref<BeatResult>({ isBeat: false, intensity: 0 });
 const drumEnergy = ref(0);
 
+// ═══ 鼓点分轨 ═══
+const drumStemSamples = ref<Float32Array | null>(null);
+const drumStemSampleRate = ref(0);
+const drumStemFileName = ref("");
+const hasDrumStem = computed(() => drumStemSamples.value !== null);
+
 // ═══════════ Config ═══════════
 const visualizerConfig = ref<VisualizerConfig>({
     particleCount: 250,
@@ -58,7 +75,7 @@ const visualizerConfig = ref<VisualizerConfig>({
     fluidActivity: 1.0,
     hueRotate: false,
     hueRotateSpeed: 1.0,
-    beatEdgeEnabled: true,
+    beatEdgeEnabled: false,
     beatEdgeSensitivity: 1.0,
     beatEdgeWidth: 0.12,
 });
@@ -70,7 +87,7 @@ const exportSettings = ref<ExportSettings>({
     encoder: "videotoolbox_h264",
     format: "mp4",
     crf: 23,
-    speedPreset: "balanced",
+    speedPreset: "quality",
 });
 
 // ═══════════ Export State ═══════════
@@ -126,6 +143,16 @@ function startTimeTracker() {
             currentTime.value = audioEngine.currentTime;
             latestSpectrum.value = audioEngine.getSpectrumData();
             if (latestSpectrum.value) {
+                // 鼓点分轨：用分轨 PCM 能量覆盖 spectrum.drumEnergy
+                if (audioEngine.hasDrumStem) {
+                    const stemEnergy = audioEngine.getDrumStemEnergy(
+                        audioEngine.currentTime,
+                    );
+                    latestSpectrum.value = {
+                        ...latestSpectrum.value,
+                        drumEnergy: stemEnergy,
+                    };
+                }
                 latestBeat.value = beatDetector.detect(latestSpectrum.value);
                 drumEnergy.value = beatDetector.drumLevel;
             }
@@ -134,7 +161,10 @@ function startTimeTracker() {
                 const t = audioEngine.currentTime;
                 let found: string | undefined;
                 for (let i = lyrics.value.length - 1; i >= 0; i--) {
-                    if (lyrics.value[i].startTime <= t) {
+                    if (
+                        lyrics.value[i].startTime <= t &&
+                        lyrics.value[i].endTime > t
+                    ) {
                         found = lyrics.value[i].text;
                         break;
                     }
@@ -166,8 +196,47 @@ async function onFileLoaded(file: File, path: string) {
     loadedFilePath.value = path;
     beatDetector.reset();
     beatDetector.sensitivity = visualizerConfig.value.beatEdgeSensitivity;
-    // Auto-navigate to studio
-    currentPage.value = "studio";
+    // 提示加载成功，不自动跳转，方便同页面继续导入分轨
+    showToast("主音频加载成功！可继续导入鼓点分轨，或前往工作室预览");
+}
+
+/** 加载鼓点分轨音频 → 解码为 PCM 浮点数组 */
+async function onDrumStemLoaded(file: File) {
+    const arrayBuffer = await file.arrayBuffer();
+    const ctx = new (
+        window.AudioContext || (window as any).webkitAudioContext
+    )();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+    // 取第一声道，转为 f32
+    const channelData = audioBuffer.getChannelData(0);
+    drumStemSamples.value = new Float32Array(channelData);
+    drumStemSampleRate.value = audioBuffer.sampleRate;
+    drumStemFileName.value = file.name;
+    audioEngine.setDrumStem(drumStemSamples.value, drumStemSampleRate.value);
+    beatDetector.stemMode = true;
+    // 自动开启边缘闪烁
+    if (!visualizerConfig.value.beatEdgeEnabled) {
+        visualizerConfig.value = {
+            ...visualizerConfig.value,
+            beatEdgeEnabled: true,
+        };
+    }
+    beatDetector.reset();
+    beatDetector.sensitivity = visualizerConfig.value.beatEdgeSensitivity;
+    await ctx.close();
+    showToast("鼓点分轨加载成功！边缘闪烁将精确匹配鼓点");
+    console.log(
+        `[App] 鼓点分轨已加载: ${file.name}, ${audioBuffer.duration.toFixed(1)}s, ${audioBuffer.sampleRate}Hz`,
+    );
+}
+
+function clearDrumStem() {
+    drumStemSamples.value = null;
+    drumStemSampleRate.value = 0;
+    drumStemFileName.value = "";
+    audioEngine.clearDrumStem();
+    beatDetector.stemMode = false;
+    beatDetector.reset();
 }
 
 function initVisualizer(canvas: HTMLCanvasElement) {
@@ -273,6 +342,12 @@ function startExport() {
         (p) => {
             exportProgress.value = { ...p };
         },
+        drumStemSamples.value
+            ? {
+                  samples: drumStemSamples.value,
+                  sampleRate: drumStemSampleRate.value,
+              }
+            : undefined,
     );
 
     cancelCurrentExport = cancel;
@@ -312,6 +387,10 @@ function onUpdateConfig(cfg: VisualizerConfig) {
     visualizerConfig.value = cfg;
     visualizer.value?.updateConfig(cfg);
     beatDetector.sensitivity = cfg.beatEdgeSensitivity;
+}
+
+function onUpdateSubtitleConfig(c: SubtitleConfig) {
+    subtitleConfig.value = c;
 }
 
 function onUpdateExportSettings(s: ExportSettings) {
@@ -366,7 +445,7 @@ onUnmounted(() => {
         <!-- Sidebar -->
         <aside class="sidebar">
             <div class="sidebar-brand">
-                <span class="brand-icon">◆</span>
+                <img class="brand-icon" src="/logo.png" alt="Sable" />
                 <span class="brand-name">Sable</span>
             </div>
             <nav class="sidebar-nav">
@@ -459,6 +538,41 @@ onUnmounted(() => {
             <!-- Page: Home (Upload) -->
             <div v-if="currentPage === 'home'" class="page-center">
                 <AudioLoader @file-loaded="onFileLoaded" />
+                <!-- Toast 提示 -->
+                <Transition name="toast-fade">
+                    <div v-if="toastMessage" class="toast">
+                        {{ toastMessage }}
+                    </div>
+                </Transition>
+                <div
+                    v-if="hasAudio && !drumStemFileName"
+                    class="drum-stem-hint"
+                >
+                    <p>上传鼓点分轨音频，边缘闪烁特效将精确匹配鼓点</p>
+                    <label class="drum-stem-upload-btn">
+                        选择鼓点分轨文件
+                        <input
+                            type="file"
+                            accept="audio/*"
+                            hidden
+                            @change="
+                                (e: Event) => {
+                                    const f = (e.target as HTMLInputElement)
+                                        .files?.[0];
+                                    if (f) onDrumStemLoaded(f);
+                                }
+                            "
+                        />
+                    </label>
+                </div>
+                <div v-if="drumStemFileName" class="drum-stem-info">
+                    <span
+                        >鼓点分轨: <strong>{{ drumStemFileName }}</strong></span
+                    >
+                    <button class="drum-stem-clear" @click="clearDrumStem">
+                        x
+                    </button>
+                </div>
                 <p v-if="!hasAudio" class="hint-text">导入音频文件开始创作</p>
             </div>
 
@@ -483,15 +597,16 @@ onUnmounted(() => {
                 :subtitle-config="subtitleConfig"
                 :latest-beat="latestBeat"
                 :drum-energy="drumEnergy"
+                :has-drum-stem="hasDrumStem"
+                :drum-stem-file-name="drumStemFileName"
                 :spectrum-config="spectrumConfig"
                 @update:config="onUpdateConfig"
                 @update:export-settings="onUpdateExportSettings"
-                @update:subtitle-config="
-                    (c: SubtitleConfig) => (subtitleConfig = c)
-                "
+                @update:subtitle-config="onUpdateSubtitleConfig"
                 @update:spectrum-config="
                     (c: SpectrumConfig) => (spectrumConfig = c)
                 "
+                @update:lyrics="(l: LyricLine[]) => (lyrics = l)"
                 @lrc-import="openLrcFile"
                 @play="play"
                 @pause="pause"
@@ -578,8 +693,9 @@ body,
 }
 
 .brand-icon {
-    font-size: 20px;
-    color: #a855f7;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
 }
 
 .brand-name {
@@ -639,7 +755,7 @@ body,
 
 .version {
     font-size: 10px;
-    color: rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.3);
     font-family: "SF Mono", monospace;
 }
 
@@ -669,17 +785,7 @@ body,
 
 .hint-text {
     font-size: 13px;
-    color: rgba(255, 255, 255, 0.2);
-}
-
-.lyric-overlay {
-    position: absolute;
-    bottom: 18%;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 15;
-    text-align: center;
-    pointer-events: none;
+    color: rgba(255, 255, 255, 0.4);
 }
 
 .lyric-text {
@@ -703,5 +809,92 @@ body,
         opacity: 1;
         transform: translateY(0);
     }
+}
+
+/* Drum stem UI */
+.drum-stem-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    margin-top: 8px;
+}
+
+.drum-stem-hint p {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.5);
+    margin: 0;
+}
+
+.drum-stem-upload-btn {
+    padding: 8px 20px;
+    border: 1px solid rgba(168, 85, 247, 0.4);
+    border-radius: 8px;
+    background: rgba(168, 85, 247, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.drum-stem-upload-btn:hover {
+    background: rgba(168, 85, 247, 0.2);
+    border-color: rgba(168, 85, 247, 0.7);
+}
+
+.drum-stem-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    border-radius: 8px;
+    background: rgba(74, 222, 128, 0.06);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 13px;
+    margin-top: 8px;
+}
+
+.drum-stem-info strong {
+    color: #4ade80;
+}
+
+.drum-stem-clear {
+    padding: 2px 8px;
+    border: none;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.5);
+    cursor: pointer;
+    font-size: 12px;
+    transition: all 0.15s;
+}
+
+.drum-stem-clear:hover {
+    background: rgba(255, 70, 70, 0.2);
+    color: rgba(255, 255, 255, 0.8);
+}
+
+/* Toast */
+.toast {
+    padding: 10px 24px;
+    background: rgba(74, 222, 128, 0.15);
+    border: 1px solid rgba(74, 222, 128, 0.3);
+    border-radius: 8px;
+    color: #4ade80;
+    font-size: 13px;
+    text-align: center;
+    max-width: 480px;
+}
+
+.toast-fade-enter-active,
+.toast-fade-leave-active {
+    transition: all 0.4s ease;
+}
+
+.toast-fade-enter-from,
+.toast-fade-leave-to {
+    opacity: 0;
+    transform: translateY(-8px);
 }
 </style>

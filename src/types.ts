@@ -21,7 +21,7 @@ export interface SpectrumData {
   averageEnergy: number
   /** 低频能量 (0-1)，用于节拍检测 */
   bassEnergy: number
-  /** 鼓点频段能量 (0-1)：bin 1-10 (43-430 Hz)，覆盖 kick/snare/toms */
+  /** 鼓点频段能量 (0-1)：bin 1-3 (43-172 Hz)，精确聚焦 kick/snare 低端，排除 bass bleed */
   drumEnergy: number
   /** 旋律频段能量 (0-1)：bin 11+ (430 Hz+)，覆盖人声/乐器/和声 */
   melodicEnergy: number
@@ -39,6 +39,8 @@ export interface BeatResult {
 export interface LyricLine {
   /** 起始时间（秒） */
   startTime: number
+  /** 结束时间（秒），默认由下一行 startTime 推算 */
+  endTime: number
   /** 该行文本 */
   text: string
   /** 逐字时间（可选，用于卡拉OK效果） */

@@ -46,6 +46,7 @@ export class ExportPipeline {
     exportSettings: ExportSettings,
     ffmpegPath: string,
     onProgress?: ProgressCallback,
+    drumStem?: { samples: Float32Array; sampleRate: number },
   ): { cancel: () => void; done: Promise<string> } {
     let unlistenProgress: UnlistenFn | null = null
     let unlistenDone: UnlistenFn | null = null
@@ -76,7 +77,7 @@ export class ExportPipeline {
 
       startExportFlow(
         audioFilePath, outputPath, exportConfig, exportSettings,
-        ffmpegPath, onProgress, () => cancelled,
+        ffmpegPath, onProgress, () => cancelled, drumStem,
       ).catch(reject)
     })
 
@@ -106,6 +107,7 @@ async function startExportFlow(
   ffmpegPath: string,
   onProgress?: ProgressCallback,
   isCancelled?: () => boolean,
+  drumStem?: { samples: Float32Array; sampleRate: number },
 ): Promise<void> {
   // 对齐到偶数：NV12 格式要求宽高为偶数，否则 VideoToolbox 硬编失败
   const width = (exportSettings.width + 1) & ~1
@@ -149,6 +151,12 @@ async function startExportFlow(
   )
   renderer.setAudioData(pcmF32, audioData.sample_rate)
 
+  // 鼓点分轨：设置独立鼓音轨 PCM 数据，覆盖频谱中的 drumEnergy
+  if (drumStem) {
+    renderer.setDrumStem(drumStem.samples, drumStem.sampleRate)
+    console.log('[Export] 鼓点分轨已启用')
+  }
+
   // 预热：预跑 ~0.3s 的帧以积累染料，避免开头空白
   const warmupFrames = Math.min(totalFrames, Math.ceil(0.3 * fps))
   for (let i = 0; i < warmupFrames; i++) {
@@ -186,6 +194,9 @@ async function startExportFlow(
 
       const pct = Math.round(((i + 1) / totalFrames) * 100)
       onProgress?.({ currentFrame: i + 1, totalFrames, percent: pct, stage: 'rendering' })
+
+      // 让出主线程给 UI 渲染，避免界面卡顿
+      await new Promise((r) => setTimeout(r, 0))
     }
   }
 

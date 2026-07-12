@@ -122,7 +122,7 @@ defineExpose({ ffmpegPath });
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: rgba(255, 255, 255, 0.4);
+    color: rgba(255, 255, 255, 0.55);
     margin-bottom: 14px;
     padding-bottom: 8px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
@@ -130,7 +130,7 @@ defineExpose({ ffmpegPath });
 
 .desc {
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.3);
+    color: rgba(255, 255, 255, 0.5);
     margin-bottom: 10px;
 }
 
@@ -174,7 +174,7 @@ defineExpose({ ffmpegPath });
 
 .ffmpeg-hint {
     font-size: 11px;
-    color: rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.4);
     margin-top: 6px;
     font-family: monospace;
     word-break: break-all;
@@ -194,7 +194,7 @@ defineExpose({ ffmpegPath });
 
 .label {
     font-size: 14px;
-    color: rgba(255, 255, 255, 0.5);
+    color: rgba(255, 255, 255, 0.65);
 }
 
 .value {

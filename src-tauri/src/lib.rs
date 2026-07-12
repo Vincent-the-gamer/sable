@@ -32,7 +32,8 @@ fn write_file_text(path: String, content: String) -> Result<(), String> {
 
 #[tauri::command]
 fn list_system_fonts() -> Vec<String> {
-    let db = fontdb::Database::new();
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
     let mut names: Vec<String> = db
         .faces()
         .filter_map(|info| info.families.first().map(|(n, _)| n.to_string()))

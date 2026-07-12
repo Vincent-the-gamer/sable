@@ -30,6 +30,10 @@ export class OfflineCompositeRenderer {
   private samples: Float32Array | null = null
   private sampleRate = 0
 
+  // 鼓点分轨 PCM（独立的鼓音轨，用于精确鼓点检测）
+  private drumStemSamples: Float32Array | null = null
+  private drumStemSampleRate = 0
+
   // 频谱渲染缓存
   private spectrumConfig: SpectrumConfig
   private rotatingHue = 260
@@ -64,7 +68,8 @@ export class OfflineCompositeRenderer {
     this.fft = new FftAnalyzer(1024)
     this.beatDetector = new BeatDetector()
 
-    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true)
+    // 导出模式启用 3x 模拟质量倍率，匹配 Retina 大屏预览的清晰度
+    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 3.0)
     this.fluidEngine.setDimensions(width, height)
 
     // 2D 合成画布（在流体之上绘制频谱和字幕），使用 DOM canvas 确保兼容
@@ -85,6 +90,13 @@ export class OfflineCompositeRenderer {
   setAudioData(samples: Float32Array, sampleRate: number): void {
     this.samples = samples
     this.sampleRate = sampleRate
+  }
+
+  /** 设置鼓点分轨 PCM 数据（用来覆盖频谱 drumEnergy，实现精确鼓点检测） */
+  setDrumStem(samples: Float32Array, sampleRate: number): void {
+    this.drumStemSamples = samples
+    this.drumStemSampleRate = sampleRate
+    this.beatDetector.stemMode = true
   }
 
   reset(): void {
@@ -255,9 +267,9 @@ export class OfflineCompositeRenderer {
     for (let i = 0; i < bassBins; i++) bassSum += freqData[i]
     const bassEnergy = bassSum / (bassBins * 255)
 
-    // drumEnergy: bin 1-10 ≈ 43-430 Hz (kick: 40-100Hz, snare: 200-500Hz, toms: 100-300Hz)
+    // drumEnergy: bin 1-3 ≈ 43-172 Hz (kick: 40-100Hz, snare low end: 129-172Hz, exclude bass bleed)
     const drumStart = 1
-    const drumEnd = Math.min(10, freqData.length - 1)
+    const drumEnd = Math.min(3, freqData.length - 1)
     let drumSum = 0
     const drumCount = drumEnd - drumStart + 1
     for (let i = drumStart; i <= drumEnd; i++) drumSum += freqData[i]
@@ -280,7 +292,20 @@ export class OfflineCompositeRenderer {
       console.log('[Spectrum] t=' + timeSeconds.toFixed(1) + 's avgE=' + averageEnergy.toFixed(3) + ' bassE=' + bassEnergy.toFixed(3) + ' drumE=' + drumEnergy.toFixed(3) + ' melE=' + melodicEnergy.toFixed(3))
     }
 
-    return { frequency: freqData, waveform: waveData, averageEnergy, bassEnergy, drumEnergy, melodicEnergy }
+    // 鼓点分轨：用独立鼓音轨 PCM 的能量覆盖 drumEnergy
+    let finalDrumEnergy = drumEnergy
+    if (this.drumStemSamples && this.drumStemSampleRate > 0) {
+      const stemIdx = Math.floor(timeSeconds * this.drumStemSampleRate)
+      const wnd = Math.min(256, this.drumStemSamples.length - Math.max(0, stemIdx))
+      if (wnd > 0) {
+        let stemSum = 0
+        for (let i = 0; i < wnd; i++) {
+          stemSum += Math.abs(this.drumStemSamples[Math.max(0, stemIdx + i)] || 0)
+        }
+        finalDrumEnergy = Math.min(1, (stemSum / wnd) * 4)
+      }
+    }
+    return { frequency: freqData, waveform: waveData, averageEnergy, bassEnergy, drumEnergy: finalDrumEnergy, melodicEnergy }
   }
 
   // ========== 节拍检测（使用 BeatDetector，与预览完全一致）==========
@@ -550,19 +575,16 @@ export class OfflineCompositeRenderer {
 
     // 查找当前时间对应的歌词行
     let currentLyric: LyricLine | null = null
-    let nextLyric: LyricLine | null = null
     for (let i = 0; i < this.lyrics.length; i++) {
       const line = this.lyrics[i]
-      if (timeSeconds >= line.startTime) {
+      if (timeSeconds >= line.startTime && timeSeconds < line.endTime) {
         currentLyric = line
-        nextLyric = i + 1 < this.lyrics.length ? this.lyrics[i + 1] : null
-      } else {
         break
       }
     }
     if (!currentLyric) return
 
-    const endTime = nextLyric ? nextLyric.startTime : (currentLyric.startTime + 5)
+    const endTime = currentLyric.endTime
     const fadeDuration = cfg.fadeDuration || 0.35
 
     // 计算入场/出场进度
@@ -720,14 +742,37 @@ export class OfflineCompositeRenderer {
     const energy = this.animState.beatGlowEnergy
     if (energy < 0.005) return
 
-    if (!(this as any)._bgd) { (this as any)._bgd = true; console.log('[BeatEdge] renderBeatEdgeGlow called, energy=' + energy.toFixed(4) + ' w=' + w + ' h=' + h) }
-
     const hue = this.fluidEngine.config.hue
     const eased = energy < 0.08 ? energy * 0.2 : 1 - Math.pow(1 - energy, 3)
     const alpha = Math.min(1, eased * 1.3)
     const maxGlowWidth = Math.min(w, h) * (this.fluidEngine.config.beatEdgeWidth ?? 0.12)
     const glowWidth = maxGlowWidth * eased
 
+    // 第 1 层：外层柔光（lighter 合成，模拟 CSS boxShadow 的外扩散层）
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    const outerWidth = glowWidth * 2.5
+    const outerEdges = [
+      { x: 0, y: 0, ew: w, eh: outerWidth },
+      { x: 0, y: h - outerWidth, ew: w, eh: outerWidth },
+      { x: 0, y: 0, ew: outerWidth, eh: h },
+      { x: w - outerWidth, y: 0, ew: outerWidth, eh: h },
+    ]
+    for (const edge of outerEdges) {
+      const isVert = edge.ew < edge.eh
+      const grad = isVert
+        ? ctx.createLinearGradient(edge.x === 0 ? 0 : w, 0, edge.x === 0 ? outerWidth : w - outerWidth, 0)
+        : ctx.createLinearGradient(0, edge.y === 0 ? 0 : h, 0, edge.y === 0 ? outerWidth : h - outerWidth)
+      grad.addColorStop(0, `hsla(${hue}, 100%, 60%, ${alpha * 0.35})`)
+      grad.addColorStop(0.3, `hsla(${hue}, 100%, 50%, ${alpha * 0.15})`)
+      grad.addColorStop(0.7, `hsla(${hue}, 80%, 45%, ${alpha * 0.04})`)
+      grad.addColorStop(1, 'transparent')
+      ctx.fillStyle = grad
+      ctx.fillRect(edge.x, edge.y, edge.ew, edge.eh)
+    }
+    ctx.restore()
+
+    // 第 2 层：内层核心辉光（原实现，正常合成）
     ctx.save()
     const edges = [
       { x: 0, y: 0, ew: w, eh: glowWidth },

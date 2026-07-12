@@ -123,7 +123,7 @@ function togglePlay() {
 
 .time {
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.5);
+    color: rgba(255, 255, 255, 0.65);
     font-variant-numeric: tabular-nums;
     min-width: 32px;
 }

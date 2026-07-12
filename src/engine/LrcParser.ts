@@ -67,12 +67,25 @@ export class LrcParser {
       }
 
       for (const startTime of timestamps) {
-        lyrics.push({ startTime, text, wordTimestamps: wordTimestamps.length > 0 ? wordTimestamps : undefined })
+        lyrics.push({
+          startTime,
+          endTime: 0, // 稍后统一推算
+          text,
+          wordTimestamps: wordTimestamps.length > 0 ? wordTimestamps : undefined,
+        })
       }
     }
 
     // 按时间排序
     lyrics.sort((a, b) => a.startTime - b.startTime)
+
+    // 推算每行结束时间：默认为下一行的开始时间，最后一行 +5s
+    for (let i = 0; i < lyrics.length; i++) {
+      lyrics[i].endTime =
+        i < lyrics.length - 1
+          ? lyrics[i + 1].startTime
+          : lyrics[i].startTime + 5
+    }
 
     return lyrics
   }
@@ -85,8 +98,7 @@ export class LrcParser {
 
     for (let i = 0; i < lyrics.length; i++) {
       const current = lyrics[i]
-      const next = lyrics[i + 1]
-      const endTime = next ? Math.min(next.startTime, current.startTime + 5) : totalDuration
+      const endTime = current.endTime ?? totalDuration
 
       lines.push(String(i + 1))
       lines.push(`${this.formatSrtTime(current.startTime)} --> ${this.formatSrtTime(endTime)}`)

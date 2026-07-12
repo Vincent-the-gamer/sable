@@ -11,6 +11,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import AudioControls from "./AudioControls.vue";
 import VisualizerCanvas from "./VisualizerCanvas.vue";
+import LyricTimeline from "./LyricTimeline.vue";
 import type {
     VisualizerConfig,
     ExportSettings,
@@ -53,6 +54,10 @@ const props = defineProps<{
     /** 平滑鼓点频段能量 (0-1)，连续信号，用于边缘闪烁 */
     drumEnergy: number;
     spectrumConfig: SpectrumConfig;
+    /** 是否已加载鼓点分轨 */
+    hasDrumStem: boolean;
+    /** 鼓点分轨文件名 */
+    drumStemFileName: string;
 }>();
 
 const emit = defineEmits<{
@@ -60,6 +65,7 @@ const emit = defineEmits<{
     (e: "update:exportSettings", settings: ExportSettings): void;
     (e: "update:subtitleConfig", config: SubtitleConfig): void;
     (e: "update:spectrumConfig", config: SpectrumConfig): void;
+    (e: "update:lyrics", lyrics: LyricLine[]): void;
     (e: "lrcImport"): void;
     (e: "play"): void;
     (e: "pause"): void;
@@ -323,7 +329,6 @@ const animState = reactive({
     shakeX: 0,
     shakeY: 0,
     scale: 1,
-    beatScaleTarget: 1,
     entranceProgress: 0,
     exitProgress: 0,
     isExiting: false,
@@ -412,16 +417,13 @@ function randomizePosition() {
         margin + Math.random() * (100 - margin * 2) * r + (1 - r) * 50;
 }
 
-function doBeatEffect() {
-    const sa = props.subtitleConfig.shakeAmount;
-    animState.shakeX = (Math.random() - 0.5) * sa * 2;
-    animState.shakeY = (Math.random() - 0.5) * sa * 2;
-    animState.beatScaleTarget = props.subtitleConfig.beatScale;
-}
-
 function tickAnimation() {
-    // 节拍边框辉光：纯鼓点触发 — 只在节拍瞬间闪亮，快速衰减到零
-    if (props.config.beatEdgeEnabled !== false && props.isPlaying) {
+    // 节拍边框辉光：需要鼓点分轨 + 启用 + 播放中
+    if (
+        props.hasDrumStem &&
+        props.config.beatEdgeEnabled !== false &&
+        props.isPlaying
+    ) {
         if (props.latestBeat?.isBeat && props.latestBeat.intensity > 0.05) {
             // 鼓点瞬间：拉到检测强度，瞬间闪亮
             animState.beatGlowEnergy = Math.max(
@@ -501,22 +503,22 @@ watch(
                 animState.entranceProgress = 0;
                 animState.entrancePhase = Math.random();
             }
+        } else if (!val && prevLyric) {
+            // 歌词变为空（空行或间隙）→ 执行出场动画后隐藏
+            animState.isExiting = true;
+            animState.exitProgress = 0;
+            setTimeout(() => {
+                prevLyric = "";
+                displayedLyric.value = "";
+                animState.isExiting = false;
+                animState.entranceProgress = 0;
+            }, 120);
         }
     },
 );
 
-// Watch for beats
-watch(
-    () => props.latestBeat,
-    (beat) => {
-        if (beat?.isBeat) {
-            doBeatEffect();
-            // Scale pulse: set target then it decays in tick
-            animState.scale = props.subtitleConfig.beatScale;
-        }
-    },
-    { deep: true },
-);
+// Watch for beats (only for beat edge glow, NOT lyrics — lyrics stay calm)
+// Removed: lyrics no longer shake/scale with beats
 
 // Computed styles for the lyric overlay
 const lyricOverlayStyle = computed(() => {
@@ -780,10 +782,12 @@ const beatBorderStyle = computed(() => {
 
 function computePreviewSize() {
     if (!previewContainer.value) return;
-    const parent = previewContainer.value.parentElement;
+    const parent = previewContainer.value.parentElement; // .preview-column
     if (!parent) return;
-    const pw = parent.clientWidth - 280;
-    const ph = parent.clientHeight;
+    const grandParent = parent.parentElement; // .studio-layout
+    if (!grandParent) return;
+    const pw = grandParent.clientWidth - 280; // reserve space for sidebar
+    const ph = grandParent.clientHeight - 116; // reserve space for timeline (~100px) + padding (16px)
     if (pw <= 0 || ph <= 0) return;
     const ratio = previewAspect.value;
     let w: number, h: number;
@@ -825,51 +829,64 @@ watch([previewContainer], () => {
 
 <template>
     <div class="studio-layout">
-        <div
-            ref="previewContainer"
-            class="preview-stage"
-            :style="{
-                width: previewWidth + 'px',
-                height: previewHeight + 'px',
-                ...beatBorderStyle,
-            }"
-        >
-            <VisualizerCanvas
-                ref="visCanvasRef"
-                :engine="engine as any"
-                :config="config"
-            />
-            <!-- 边缘鼓点辉光叠加层（Canvas 渲染，导出可见） -->
-            <canvas ref="beatEdgeCanvasRef" class="beat-edge-canvas" />
-            <!-- 频谱可视化叠加层 -->
-            <canvas ref="spectrumCanvasRef" class="spectrum-canvas" />
-            <!-- 歌词字幕叠加层 -->
+        <div class="preview-column">
             <div
-                v-if="hasLyrics && displayedLyric"
-                class="lyric-overlay"
-                :style="lyricOverlayStyle"
+                ref="previewContainer"
+                class="preview-stage"
+                :style="{
+                    width: previewWidth + 'px',
+                    height: previewHeight + 'px',
+                    ...beatBorderStyle,
+                }"
             >
-                <span
-                    class="lyric-text"
-                    :key="displayedLyric"
-                    :style="lyricTextStyle"
-                    >{{ displayedLyric }}</span
-                >
-            </div>
-            <div v-if="hasAudio" class="player-overlay">
-                <AudioControls
-                    :is-playing="isPlaying"
-                    :current-time="currentTime"
-                    :duration="duration"
-                    :has-audio="hasAudio"
-                    @play="emit('play')"
-                    @pause="emit('pause')"
-                    @seek="(t) => emit('seek', t)"
+                <VisualizerCanvas
+                    ref="visCanvasRef"
+                    :engine="engine as any"
+                    :config="config"
                 />
+                <!-- 边缘鼓点辉光叠加层（Canvas 渲染，导出可见） -->
+                <canvas ref="beatEdgeCanvasRef" class="beat-edge-canvas" />
+                <!-- 频谱可视化叠加层 -->
+                <canvas ref="spectrumCanvasRef" class="spectrum-canvas" />
+                <!-- 歌词字幕叠加层 -->
+                <div
+                    v-if="hasLyrics && displayedLyric"
+                    class="lyric-overlay"
+                    :style="lyricOverlayStyle"
+                >
+                    <span
+                        class="lyric-text"
+                        :key="displayedLyric"
+                        :style="lyricTextStyle"
+                        >{{ displayedLyric }}</span
+                    >
+                </div>
+                <div v-if="hasAudio" class="player-overlay">
+                    <AudioControls
+                        :is-playing="isPlaying"
+                        :current-time="currentTime"
+                        :duration="duration"
+                        :has-audio="hasAudio"
+                        @play="emit('play')"
+                        @pause="emit('pause')"
+                        @seek="(t) => emit('seek', t)"
+                    />
+                </div>
+                <div class="ratio-badge">
+                    {{ exportSettings.width }}×{{ exportSettings.height }}
+                </div>
             </div>
-            <div class="ratio-badge">
-                {{ exportSettings.width }}×{{ exportSettings.height }}
-            </div>
+
+            <LyricTimeline
+                v-if="hasLyrics"
+                class="timeline-below"
+                :lyrics="lyrics"
+                :duration="duration"
+                :current-time="currentTime"
+                :is-playing="isPlaying"
+                @update:lyrics="(l) => emit('update:lyrics', l)"
+                @seek="(t) => emit('seek', t)"
+            />
         </div>
 
         <div class="sidebar-panel">
@@ -1085,9 +1102,12 @@ watch([previewContainer], () => {
                     />
                 </div>
                 <!-- ═══ 边缘鼓点闪烁 ═══ -->
+                <!-- 边缘鼓点闪烁 -->
                 <div class="section-sep" />
                 <div class="control-row">
-                    <label><span class="param-label">边缘鼓点闪烁</span></label>
+                    <label
+                        ><span class="param-label">边缘鼓点闪烁 🥁</span></label
+                    >
                     <div class="chip-row">
                         <button
                             class="chip"
@@ -1406,6 +1426,12 @@ watch([previewContainer], () => {
                                 "
                             >
                                 <option
+                                    value="inherit"
+                                    :style="{ fontFamily: 'inherit' }"
+                                >
+                                    系统默认
+                                </option>
+                                <option
                                     v-for="f in filteredFonts"
                                     :key="f"
                                     :value="f"
@@ -1603,32 +1629,6 @@ watch([previewContainer], () => {
                             @input="
                                 emitSubtitleConfig({
                                     driftSpeed: Number(
-                                        ($event.target as HTMLInputElement)
-                                            .value,
-                                    ),
-                                })
-                            "
-                        />
-                    </div>
-
-                    <div class="control-row">
-                        <label
-                            ><span class="param-label">节拍缩放</span
-                            ><span class="param-value"
-                                >{{
-                                    subtitleConfig.beatScale.toFixed(1)
-                                }}x</span
-                            ></label
-                        >
-                        <input
-                            type="range"
-                            min="1"
-                            max="2"
-                            step="0.05"
-                            :value="subtitleConfig.beatScale"
-                            @input="
-                                emitSubtitleConfig({
-                                    beatScale: Number(
                                         ($event.target as HTMLInputElement)
                                             .value,
                                     ),
@@ -2017,9 +2017,19 @@ watch([previewContainer], () => {
     display: flex;
     width: 100%;
     height: 100%;
-    align-items: center;
+    align-items: stretch;
     justify-content: center;
     background: #000;
+    gap: 0;
+}
+.preview-column {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    overflow: hidden;
+    padding: 12px 0;
 }
 .preview-stage {
     position: relative;
@@ -2031,6 +2041,10 @@ watch([previewContainer], () => {
         box-shadow 0.12s ease-out,
         border-color 0.12s ease-out,
         border-width 0.12s ease-out;
+}
+.timeline-below {
+    width: 100%;
+    flex-shrink: 0;
 }
 .spectrum-canvas {
     position: absolute;
@@ -2092,7 +2106,7 @@ watch([previewContainer], () => {
     padding: 12px 0;
     border: none;
     background: transparent;
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.55);
     font-size: 13px;
     cursor: pointer;
     transition: all 0.15s;
@@ -2123,7 +2137,7 @@ watch([previewContainer], () => {
 .panel-header h3 {
     font-size: 13px;
     font-weight: 600;
-    color: rgba(255, 255, 255, 0.7);
+    color: rgba(255, 255, 255, 0.85);
     margin: 0;
 }
 .reset-btn {
@@ -2257,7 +2271,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.5);
 }
 .preset-row {
     display: flex;
@@ -2800,5 +2814,24 @@ input[type="range"]::-webkit-slider-thumb:hover {
         opacity: 1;
         filter: blur(0);
     }
+}
+
+.drum-stem-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.drum-stem-note {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.5);
+    margin: 0;
+}
+
+.drum-stem-note-sub {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.35);
+    margin: 0;
 }
 </style>

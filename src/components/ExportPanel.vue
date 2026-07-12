@@ -107,7 +107,7 @@ function resetDefaults() {
         encoder: "videotoolbox_h264",
         format: "mp4",
         crf: 23,
-        speedPreset: "balanced",
+        speedPreset: "quality",
     };
     emitChange();
 }
@@ -266,7 +266,7 @@ function resetDefaults() {
 .panel-header h3 {
     font-size: 14px;
     font-weight: 600;
-    color: rgba(255, 255, 255, 0.75);
+    color: rgba(255, 255, 255, 0.85);
     margin: 0;
 }
 
@@ -275,7 +275,7 @@ function resetDefaults() {
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 6px;
     background: transparent;
-    color: rgba(255, 255, 255, 0.4);
+    color: rgba(255, 255, 255, 0.55);
     font-size: 11px;
     cursor: pointer;
     transition: all 0.15s;
@@ -296,7 +296,7 @@ function resetDefaults() {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.5);
 }
 
 .preset-row {
@@ -448,7 +448,7 @@ function resetDefaults() {
     display: flex;
     justify-content: space-between;
     font-size: 10px;
-    color: rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.4);
 }
 
 input[type="range"] {
@@ -494,7 +494,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .summary-row span:first-child {
-    color: rgba(255, 255, 255, 0.35);
+    color: rgba(255, 255, 255, 0.5);
 }
 
 .summary-row span:last-child {

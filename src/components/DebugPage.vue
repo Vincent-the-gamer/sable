@@ -1,79 +1,16 @@
 <script setup lang="ts">
 /**
- * 调试面板：捕获所有 console 日志 + 显示应用运行状态
+ * 调试面板：显示应用运行状态 + 全局 console 日志
+ * 日志由 initLogger() 在 main.ts 中全局捕获，本组件只负责展示
  */
 
-import { ref, onMounted, onUnmounted, computed } from "vue";
+import { ref } from "vue";
 import type { SpectrumData, BeatResult } from "../types";
+import { useLogger, type LogEntry } from "../composables/useLogger";
 
-// ── 日志系统 ──
+// ── 日志系统（从全局 Store 读取）──
 
-interface LogEntry {
-    id: number;
-    type: "log" | "warn" | "error" | "debug";
-    message: string;
-    timestamp: number;
-}
-
-const logs = ref<LogEntry[]>([]);
-const maxLogs = 500;
-let nextId = 0;
-
-function addLog(type: LogEntry["type"], message: string) {
-    logs.value.push({ id: nextId++, type, message, timestamp: Date.now() });
-    if (logs.value.length > maxLogs) {
-        logs.value.splice(0, logs.value.length - maxLogs);
-    }
-}
-
-const originalConsole = {
-    log: console.log,
-    warn: console.warn,
-    error: console.error,
-    debug: console.debug,
-};
-
-function formatArgs(args: unknown[]): string {
-    return args
-        .map((a) => {
-            if (a instanceof Error) return a.stack || a.message;
-            if (typeof a === "object") {
-                try {
-                    return JSON.stringify(a, null, 2);
-                } catch {
-                    return String(a);
-                }
-            }
-            return String(a);
-        })
-        .join(" ");
-}
-
-function installConsoleHook() {
-    console.log = (...args: unknown[]) => {
-        addLog("log", formatArgs(args));
-        originalConsole.log(...args);
-    };
-    console.warn = (...args: unknown[]) => {
-        addLog("warn", formatArgs(args));
-        originalConsole.warn(...args);
-    };
-    console.error = (...args: unknown[]) => {
-        addLog("error", formatArgs(args));
-        originalConsole.error(...args);
-    };
-    console.debug = (...args: unknown[]) => {
-        addLog("debug", formatArgs(args));
-        originalConsole.debug(...args);
-    };
-}
-
-function uninstallConsoleHook() {
-    console.log = originalConsole.log;
-    console.warn = originalConsole.warn;
-    console.error = originalConsole.error;
-    console.debug = originalConsole.debug;
-}
+const { logs, logCounts, clearLogs } = useLogger();
 
 // ── 运行状态 ──
 
@@ -116,10 +53,6 @@ function toggleLogExpand(id: number) {
     }
 }
 
-function clearLogs() {
-    logs.value = [];
-}
-
 function formatTime(ts: number) {
     const d = new Date(ts);
     return (
@@ -136,23 +69,6 @@ function formatTime(ts: number) {
 function typeClass(type: LogEntry["type"]): string {
     return "log-" + type;
 }
-
-const logCounts = computed(() => {
-    const c = { log: 0, warn: 0, error: 0, debug: 0 };
-    for (const l of logs.value) c[l.type]++;
-    return c;
-});
-
-// ── 生命周期 ──
-
-onMounted(() => {
-    installConsoleHook();
-    addLog("debug", "🔧 调试面板已启动，开始捕获日志");
-});
-
-onUnmounted(() => {
-    uninstallConsoleHook();
-});
 </script>
 
 <template>
