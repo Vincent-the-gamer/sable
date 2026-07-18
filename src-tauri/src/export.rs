@@ -1,8 +1,9 @@
-use std::io::Write;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter};
+
+use crate::frame_buffer::{drain_to_ffmpeg, SharedFrameBuffer};
 
 // ═══════════ Cancel ═══════════
 
@@ -18,58 +19,47 @@ fn is_cancelled() -> bool {
     CANCEL_FLAG.lock().map(|f| *f).unwrap_or(false)
 }
 
-// ═══════════ Piped Export State ═══════════
+// ═══════════ Shared Frame Buffer Export State ═══════════
 
-struct PipedExport {
+struct SharedExport {
+    frame_buffer: SharedFrameBuffer,
     child: Child,
-    stdin: ChildStdin,
     output_path: String,
+    drain_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-static PIPED_EXPORT: Mutex<Option<PipedExport>> = Mutex::new(None);
+static SHARED_EXPORT: Mutex<Option<SharedExport>> = Mutex::new(None);
 
-/// Start ffmpeg piped encoding (frames sent via send_piped_chunk)
-pub fn start_piped_export(
-    app: &AppHandle,
+// ═══════════ FFmpeg Command Builder ═══════════
+
+fn build_ffmpeg_command(
+    ffmpeg: &str,
     output_path: &str,
     audio_path: &str,
     width: u32,
     height: u32,
     fps: u32,
     encoder: &str,
-    _format: &str,
     crf: u8,
     speed_preset: &str,
-    ffmpeg_path: Option<&str>,
-) -> Result<(), String> {
-    let ffmpeg = ffmpeg_path.unwrap_or("ffmpeg");
-
-    // NV12 要求宽高均为偶数；上对齐以避免 VideoToolbox/swscale 硬编失败
+) -> Command {
+    // NV12 要求宽高均为偶数
     let width = ((width + 1) >> 1) << 1;
     let height = ((height + 1) >> 1) << 1;
 
     let mut cmd = Command::new(ffmpeg);
-    // 基础参数：覆盖输出，自动线程，恒定帧率，加速管道识别
     cmd.args([
         "-y",
         "-fflags",
         "+genpts",
         "-threads",
-        "0", // 自动检测 CPU 线程数
-        "-vsync",
-        "cfr", // 恒定帧率
+        "0",
         "-f",
         "rawvideo",
-        "-probesize",
-        "32", // 最小分析大小，加速 rawvideo 管道输入
-        "-analyzeduration",
-        "0", // 跳过流分析
-        "-thread_queue_size",
-        "1024", // 增大输入管道缓冲，避免写端等待
         "-s",
         &format!("{width}x{height}"),
         "-pix_fmt",
-        "bgra", // 输出 BGRA，VideoToolbox 原生支持，跳过软件 CSC
+        "rgba",
         "-r",
         &fps.to_string(),
         "-i",
@@ -78,11 +68,10 @@ pub fn start_piped_export(
         audio_path,
     ]);
 
-    // 色度缩放：使用 fast_bilinear（对 NV12 子采样后的渐变内容视觉差异极小，
-    // 但比 lanczos 快 20x 以上，是管道导出最大的性能热点）
+    // 色度缩放：fast_bilinear 比 lanczos 快 20x
     cmd.args(["-sws_flags", "fast_bilinear"]);
 
-    // ═══ 通用参数：码率计算 + 色度缩放（对所有硬件编码器生效） ═══
+    // ═══ Encoder-specific arguments ═══
     let bpp_quality = 0.45;
     let bpp_balanced = 0.30;
     let bpp_fast = 0.18;
@@ -101,7 +90,6 @@ pub fn start_piped_export(
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
             let bitrate_str = bitrate.to_string();
-            // VideoToolbox 原生接受 BGRA 像素，无需软件 -vf format=nv12
             let mut args = vec![
                 "-c:v",
                 "h264_videotoolbox",
@@ -126,7 +114,6 @@ pub fn start_piped_export(
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
             let bitrate_str = bitrate.to_string();
-            // VideoToolbox 原生接受 BGRA 像素，无需软件 -vf format=nv12
             let mut args = vec![
                 "-c:v",
                 "hevc_videotoolbox",
@@ -145,6 +132,8 @@ pub fn start_piped_export(
         }
 
         // ─── NVIDIA: NVENC ───
+        // Direct system memory input — no hwupload_cuda filter needed.
+        // NVENC handles GPU upload internally, which is faster than a separate filter.
         "nvenc_h264" => {
             let bpp = match speed_preset {
                 "quality" => bpp_quality,
@@ -154,25 +143,22 @@ pub fn start_piped_export(
                 _ => bpp_ultrafast,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
-            let bitrate_str = bitrate.to_string();
             let preset = match speed_preset {
-                "quality" => "p4",
-                "balanced" => "p3",
-                "fast" => "p2",
-                "superfast" => "p1",
-                _ => "p1",
+                "quality" => "slow",
+                "balanced" => "medium",
+                "fast" => "fast",
+                "superfast" => "faster",
+                _ => "max",
             };
             cmd.args([
-                "-vf",
-                "format=nv12,hwupload_cuda",
                 "-c:v",
                 "h264_nvenc",
                 "-preset",
                 preset,
                 "-b:v",
-                &bitrate_str,
-                "-pix_fmt:v",
-                "yuv420p",
+                &bitrate.to_string(),
+                "-tune",
+                "ll",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -189,27 +175,24 @@ pub fn start_piped_export(
                 _ => 0.055,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
-            let bitrate_str = bitrate.to_string();
             let preset = match speed_preset {
-                "quality" => "p4",
-                "balanced" => "p3",
-                "fast" => "p2",
-                "superfast" => "p1",
-                _ => "p1",
+                "quality" => "slow",
+                "balanced" => "medium",
+                "fast" => "fast",
+                "superfast" => "faster",
+                _ => "max",
             };
             cmd.args([
-                "-vf",
-                "format=nv12,hwupload_cuda",
                 "-c:v",
                 "hevc_nvenc",
                 "-preset",
                 preset,
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
+                "-tune",
+                "ll",
                 "-tag:v",
                 "hvc1",
-                "-pix_fmt:v",
-                "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -228,11 +211,9 @@ pub fn start_piped_export(
                 _ => bpp_ultrafast,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
-            let bitrate_str = bitrate.to_string();
             let quality = match speed_preset {
                 "quality" => "quality",
                 "balanced" => "balanced",
-                "fast" => "speed",
                 _ => "speed",
             };
             cmd.args([
@@ -243,9 +224,7 @@ pub fn start_piped_export(
                 "-quality",
                 quality,
                 "-b:v",
-                &bitrate_str,
-                "-pix_fmt:v",
-                "yuv420p",
+                &bitrate.to_string(),
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -262,11 +241,9 @@ pub fn start_piped_export(
                 _ => 0.055,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
-            let bitrate_str = bitrate.to_string();
             let quality = match speed_preset {
                 "quality" => "quality",
                 "balanced" => "balanced",
-                "fast" => "speed",
                 _ => "speed",
             };
             cmd.args([
@@ -277,11 +254,9 @@ pub fn start_piped_export(
                 "-quality",
                 quality,
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
                 "-tag:v",
                 "hvc1",
-                "-pix_fmt:v",
-                "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -300,14 +275,13 @@ pub fn start_piped_export(
                 _ => bpp_ultrafast,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
-            let bitrate_str = bitrate.to_string();
             cmd.args([
                 "-vf",
                 "format=nv12,hwupload=extra_hw_frames=64",
                 "-c:v",
                 "h264_qsv",
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
                 "-pix_fmt:v",
                 "nv12",
                 "-c:a",
@@ -326,14 +300,13 @@ pub fn start_piped_export(
                 _ => 0.055,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
-            let bitrate_str = bitrate.to_string();
             cmd.args([
                 "-vf",
                 "format=nv12,hwupload=extra_hw_frames=64",
                 "-c:v",
                 "hevc_qsv",
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
                 "-tag:v",
                 "hvc1",
                 "-pix_fmt:v",
@@ -356,14 +329,13 @@ pub fn start_piped_export(
                 _ => bpp_ultrafast,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
-            let bitrate_str = bitrate.to_string();
             cmd.args([
                 "-vf",
                 "format=nv12,hwupload",
                 "-c:v",
                 "h264_vaapi",
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
                 "-pix_fmt:v",
                 "vaapi",
                 "-c:a",
@@ -382,14 +354,13 @@ pub fn start_piped_export(
                 _ => 0.055,
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
-            let bitrate_str = bitrate.to_string();
             cmd.args([
                 "-vf",
                 "format=nv12,hwupload",
                 "-c:v",
                 "hevc_vaapi",
                 "-b:v",
-                &bitrate_str,
+                &bitrate.to_string(),
                 "-tag:v",
                 "hvc1",
                 "-pix_fmt:v",
@@ -401,6 +372,8 @@ pub fn start_piped_export(
                 "-shortest",
             ]);
         }
+
+        // ─── Software encoders ───
         "software_vp9" => {
             let (cpu_used, deadline) = match speed_preset {
                 "quality" => ("0", "good"),
@@ -498,18 +471,53 @@ pub fn start_piped_export(
         }
     }
 
-    // 防止编码队列过大导致的卡顿
     cmd.args(["-max_muxing_queue_size", "9999"]);
     cmd.arg(output_path);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
+    cmd
+}
+
+// ═══════════ Public API ═══════════
+
+/// Start ffmpeg with shared frame buffer.
+/// JS renders frames into the buffer via `push_frame`,
+/// a Rust background thread drains them into FFmpeg stdin.
+/// Frame data stays in Rust heap — zero IPC serialization of frame bytes.
+pub fn start_piped_export(
+    app: &AppHandle,
+    output_path: &str,
+    audio_path: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    encoder: &str,
+    _format: &str,
+    crf: u8,
+    speed_preset: &str,
+    ffmpeg_path: Option<&str>,
+) -> Result<(), String> {
+    let ffmpeg = ffmpeg_path.unwrap_or("ffmpeg");
+
+    let mut cmd = build_ffmpeg_command(
+        ffmpeg,
+        output_path,
+        audio_path,
+        width,
+        height,
+        fps,
+        encoder,
+        crf,
+        speed_preset,
+    );
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
 
-    // 立即启动后台线程读取 stderr，防止管道阻塞 + 提供调试信息
+    // Read stderr in background to prevent pipe deadlock
     let stderr = child.stderr.take();
     std::thread::spawn(move || {
         if let Some(stderr) = stderr {
@@ -532,11 +540,27 @@ pub fn start_piped_export(
 
     let stdin = child.stdin.take().ok_or("Cannot get ffmpeg stdin")?;
 
-    let mut guard = PIPED_EXPORT.lock().unwrap();
-    *guard = Some(PipedExport {
+    // Create shared frame buffer. total_frames starts at 0 so the drain
+    // thread won't early-exit on sent >= total. JS sets the real count via push_frame.
+    let frame_buffer = SharedFrameBuffer::new(width, height, 0);
+
+    // Spawn background drain thread
+    let app_clone = app.clone();
+    let fb_clone = frame_buffer.clone_for_drain();
+    let drain_handle = std::thread::spawn(move || {
+        let result = drain_to_ffmpeg(&fb_clone, stdin, &app_clone);
+        match result {
+            Ok(sent) => eprintln!("[export] Drained {sent} frames"),
+            Err(e) => eprintln!("[export] Drain error: {e}"),
+        }
+    });
+
+    let mut guard = SHARED_EXPORT.lock().unwrap();
+    *guard = Some(SharedExport {
+        frame_buffer,
         child,
-        stdin,
         output_path: output_path.to_string(),
+        drain_handle: Some(drain_handle),
     });
 
     let _ = app.emit(
@@ -552,102 +576,54 @@ pub fn start_piped_export(
     Ok(())
 }
 
-/// Send a chunk of frames to ffmpeg (base64 encoded RGBA data)
-pub fn send_piped_chunk(
-    app: &AppHandle,
-    base64_data: &str,
-    total_frames: u32,
-) -> Result<(), String> {
-    let mut guard = PIPED_EXPORT.lock().unwrap();
-    let export = guard.as_mut().ok_or("Pipe not started")?;
+/// Push a batch of rendered frames into the shared buffer.
+/// `data` contains `frame_count` contiguous RGBA frames.
+/// Frame data is copied into Rust heap — no IPC serialization after this point.
+pub fn push_frames(data: Vec<u8>, frame_count: u32, total_frames: u32) -> Result<u32, String> {
+    let t0 = std::time::Instant::now();
 
-    if is_cancelled() {
-        return Err("Cancelled".into());
-    }
+    // Extract the buffer Arc while holding the global lock, then release it
+    // before the expensive frame-copy loop so drain can run concurrently.
+    let fb = {
+        let guard = SHARED_EXPORT.lock().unwrap();
+        let export = guard.as_ref().ok_or("Pipe not started")?;
 
-    let bytes = base64_decode(base64_data)?;
-    export
-        .stdin
-        .write_all(&bytes)
-        .map_err(|e| format!("Pipe write failed: {e}"))?;
+        if is_cancelled() {
+            return Err("Cancelled".into());
+        }
 
-    let _ = app.emit(
-        "export-progress",
-        serde_json::json!({
-            "current_frame": 0u32,
-            "total_frames": total_frames,
-            "percent": 0u32,
-            "stage": "rendering"
-        }),
+        // Update total frames on first push so the drain thread knows when to stop
+        export.frame_buffer.set_total_frames(total_frames);
+
+        export.frame_buffer.clone_for_push()
+    };
+
+    // Split the contiguous data into individual frame slices
+    let frame_size = data.len() / frame_count as usize;
+    let frame_refs: Vec<&[u8]> = data.chunks(frame_size).take(frame_count as usize).collect();
+
+    let (first, last) = fb.push_frames(&frame_refs)?;
+    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[export:push] batch {}+{} copy {:.1}ms",
+        first, frame_count, elapsed
     );
-
-    Ok(())
+    Ok(last - first)
 }
 
-/// Send raw RGBA bytes directly to ffmpeg stdin (called via raw IPC, no base64 overhead)
-pub fn send_raw_chunk(app: &AppHandle, data: &[u8], total_frames: u32) -> Result<(), String> {
-    let mut guard = PIPED_EXPORT.lock().unwrap();
-    let export = guard.as_mut().ok_or("Pipe not started")?;
-
-    if is_cancelled() {
-        return Err("Cancelled".into());
-    }
-
-    export
-        .stdin
-        .write_all(data)
-        .map_err(|e| format!("Pipe write failed: {e}"))?;
-
-    let _ = app.emit(
-        "export-progress",
-        serde_json::json!({
-            "current_frame": 0u32,
-            "total_frames": total_frames,
-            "percent": 0u32,
-            "stage": "rendering"
-        }),
-    );
-
-    Ok(())
-}
-
-/// Send a chunk of raw RGBA bytes from a temp file to ffmpeg
-pub fn send_piped_chunk_file(app: &AppHandle, path: &str, total_frames: u32) -> Result<(), String> {
-    let mut guard = PIPED_EXPORT.lock().unwrap();
-    let export = guard.as_mut().ok_or("Pipe not started")?;
-
-    if is_cancelled() {
-        return Err("Cancelled".into());
-    }
-
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("Failed to read chunk file {path}: {e}"))?;
-
-    export
-        .stdin
-        .write_all(&bytes)
-        .map_err(|e| format!("Pipe write failed: {e}"))?;
-
-    let _ = app.emit(
-        "export-progress",
-        serde_json::json!({
-            "current_frame": 0u32,
-            "total_frames": total_frames,
-            "percent": 0u32,
-            "stage": "rendering"
-        }),
-    );
-
-    Ok(())
-}
-
-/// Close stdin and wait for ffmpeg to finish
-/// Reads stderr in background to prevent pipe deadlock
+/// Signal that JS has finished rendering all frames.
+/// The background drain thread will finish once the buffer is empty.
 pub fn finish_piped_export(app: &AppHandle) -> Result<(), String> {
-    let mut guard = PIPED_EXPORT.lock().unwrap();
+    let mut guard = SHARED_EXPORT.lock().unwrap();
     let mut export = guard.take().ok_or("Pipe not started")?;
 
-    drop(export.stdin);
+    // Signal done to the drain thread
+    export.frame_buffer.mark_done();
+
+    // Wait for drain thread to finish
+    if let Some(handle) = export.drain_handle.take() {
+        let _ = handle.join();
+    }
 
     let _ = app.emit(
         "export-progress",
@@ -659,27 +635,7 @@ pub fn finish_piped_export(app: &AppHandle) -> Result<(), String> {
         }),
     );
 
-    // 后台线程读取 stderr，防止管道阻塞 + 提供调试信息
-    let stderr = export.child.stderr.take();
-    std::thread::spawn(move || {
-        if let Some(stderr) = stderr {
-            use std::io::Read;
-            let mut buf = [0u8; 4096];
-            let mut reader = std::io::BufReader::new(stderr);
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(s) = std::str::from_utf8(&buf[..n]) {
-                            eprintln!("[ffmpeg] {}", s.trim());
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    });
-
+    // Wait for FFmpeg to finish
     let status = export
         .child
         .wait()
@@ -697,46 +653,15 @@ pub fn finish_piped_export(app: &AppHandle) -> Result<(), String> {
 
 /// Force kill piped export
 pub fn abort_piped_export() {
-    if let Ok(mut guard) = PIPED_EXPORT.lock() {
+    if let Ok(mut guard) = SHARED_EXPORT.lock() {
         if let Some(mut export) = guard.take() {
+            export.frame_buffer.cancel();
+            if let Some(handle) = export.drain_handle.take() {
+                let _ = handle.join();
+            }
             let _ = export.child.kill();
-            drop(export.stdin);
             let _ = export.child.wait();
             let _ = std::fs::remove_file(&export.output_path);
         }
     }
-}
-
-// ═══════════ Base64 ═══════════
-
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let input = input.trim_end_matches('=');
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    let mut table = [0xffu8; 128];
-    for (i, &c) in CHARS.iter().enumerate() {
-        table[c as usize] = i as u8;
-    }
-
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-
-    for byte in input.bytes() {
-        if byte > 127 {
-            return Err(format!("Invalid base64 char: {}", byte as char));
-        }
-        let value = table[byte as usize];
-        if value == 0xff {
-            return Err(format!("Invalid base64: {}", byte as char));
-        }
-        buffer = (buffer << 6) | value as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    Ok(output)
 }

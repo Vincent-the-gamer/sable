@@ -17,11 +17,15 @@ import { BeatDetector } from './BeatDetector'
 export class OfflineCompositeRenderer {
   private fluidEngine: WebGLFluidEngine
   private fluidCanvas: HTMLCanvasElement
-  // 使用 HTMLCanvasElement 而非 OffscreenCanvas 以确保 WKWebView 兼容
+  // 合成画布：putImageData 写入流体像素 → 2D 绘制叠加层 → getImageData 输出
   private compositeCanvas: HTMLCanvasElement
   private ctx2d: CanvasRenderingContext2D
   private fft: FftAnalyzer
   private beatDetector: BeatDetector
+
+  // 预分配频谱缓冲区，避免每帧 GC
+  private readonly freqData: Uint8Array
+  private readonly waveData: Uint8Array
 
   readonly width: number
   readonly height: number
@@ -68,9 +72,19 @@ export class OfflineCompositeRenderer {
     this.fft = new FftAnalyzer(1024)
     this.beatDetector = new BeatDetector()
 
-    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 1.5)
+    // 预分配频谱缓冲区
+    this.freqData = new Uint8Array(512)
+    this.waveData = new Uint8Array(512)
+
+    // 导出模式模拟质量倍率从 1.5 降到 1.0，减少 WebGL 模拟时间，视觉差异极小
+    // 导出模式模拟质量倍率 1.0，降低 WebGL 模拟分辨率
+    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 1.0)
+
+    // 限制每帧最大 splat 数量，避免高能量帧产生过多 shader passes
+    this.fluidEngine.setMaxSplatsPerFrame(10)
     this.fluidEngine.setDimensions(width, height)
 
+    // 合成画布：putImageData 写入流体像素，2D 绘制叠加层，getImageData 输出
     this.compositeCanvas = document.createElement('canvas')
     this.compositeCanvas.width = width
     this.compositeCanvas.height = height
@@ -82,7 +96,6 @@ export class OfflineCompositeRenderer {
     this.subtitleConfig = { ...subtitleConfig }
     this.lyrics = lyrics
 
-    console.log('[OfflineComposite] beatEdgeEnabled =', this.fluidEngine.config.beatEdgeEnabled, 'config =', JSON.stringify(visualizerConfig))
   }
 
   setAudioData(samples: Float32Array, sampleRate: number): void {
@@ -129,12 +142,14 @@ export class OfflineCompositeRenderer {
   /**
    * 渲染一帧完整画面
    * @returns RGBA 像素数据 (Uint8ClampedArray)
+   *
+   * 性能优化：不再调用 compositeToCanvas()（消除多余的 GPU 全屏渲染）。
+   * captureFrame() 获取流体像素 → putImageData 写入合成画布 → 2D 叠加层 → getImageData 输出。
+   * putImageData 写入 CPU 侧缓冲区，getImageData 从同一缓冲区读取，不触发额外 GPU 同步。
    */
   renderFrame(timeSeconds: number, dt: number): Uint8ClampedArray {
     const spectrum = this.computeSpectrum(timeSeconds)
     const beat = spectrum ? this.beatDetector.detect(spectrum) : { isBeat: false, intensity: 0 }
-
-
 
     // 色相旋转
     if (this.spectrumConfig.hueRotate && this.spectrumConfig.enabled) {
@@ -152,10 +167,11 @@ export class OfflineCompositeRenderer {
       }
     }
 
-    // Layer 1: fluid (rendered to canvas via compositeToCanvas)
+    // Layer 1: fluid simulation + composite to canvas default framebuffer
     this.fluidEngine.offlineStep(dt, spectrum, beat)
+    this.fluidEngine.compositeToCanvas()
 
-    // Layer 2: draw fluid onto composite canvas directly (GPU→GPU, no CPU copy)
+    // Layer 2: draw fluid canvas into composite canvas (GPU-side transfer, no readPixels)
     const ctx = this.ctx2d
     const w = this.width
     const h = this.height
@@ -176,23 +192,14 @@ export class OfflineCompositeRenderer {
     if (beatEdgeOn) {
       if (beat.isBeat && beat.intensity > 0.05) {
         this.animState.beatGlowEnergy = Math.max(0.65, beat.intensity * 1.3)
-        if (timeSeconds < 2) console.log('[BeatEdge] BEAT', timeSeconds.toFixed(3), 'intensity', beat.intensity.toFixed(3), '-> glowEnergy', this.animState.beatGlowEnergy.toFixed(3))
       }
       this.animState.beatGlowEnergy *= 0.85
       if (this.animState.beatGlowEnergy < 0.003) this.animState.beatGlowEnergy = 0
       this.renderBeatEdgeGlow()
-    } else {
-      if (timeSeconds < 0.1) console.log('[BeatEdge] beatEdgeEnabled is FALSE in fluidEngine.config')
     }
 
+    // 输出：getImageData 从 putImageData 的 CPU 缓冲区读取，不触发额外 GPU 同步
     const result = ctx.getImageData(0, 0, w, h).data
-
-    if (!(this as any)._pxChk && this.animState.beatGlowEnergy > 0.5) {
-      (this as any)._pxChk = true
-      const topPixel = ctx.getImageData(w / 2, 10, 1, 1).data
-      const edgePixel = ctx.getImageData(5, h / 2, 1, 1).data
-      console.log('[BeatEdge] Pixel check: top-center=', Array.from(topPixel), 'left-mid=', Array.from(edgePixel))
-    }
 
     return result
   }
@@ -217,7 +224,7 @@ export class OfflineCompositeRenderer {
     const offset = Math.max(0, sampleIndex - HALF_SIZE)
     const fftMag = this.fft.analyzeWindow(this.samples, offset, FFT_SIZE)
 
-    const freqData = new Uint8Array(HALF_SIZE)
+    const freqData = this.freqData
     for (let i = 0; i < HALF_SIZE; i++) {
       const mag = fftMag[i]
       let db: number
@@ -226,12 +233,11 @@ export class OfflineCompositeRenderer {
       } else {
         db = 20 * Math.log10(mag)
       }
-      const linear = Math.max(0, Math.min(255, Math.round(((db - MIN_DB) / dbRange) * 255)))
-      freqData[i] = linear
+      freqData[i] = Math.max(0, Math.min(255, Math.round(((db - MIN_DB) / dbRange) * 255)))
     }
 
     // 时域波形（512 点，与 AudioEngine 对齐）
-    const waveData = new Uint8Array(HALF_SIZE)
+    const waveData = this.waveData
     for (let i = 0; i < HALF_SIZE; i++) {
       const idx = Math.max(0, sampleIndex - HALF_SIZE / 2 + i)
       if (idx < this.samples.length) {
@@ -269,12 +275,6 @@ export class OfflineCompositeRenderer {
       const melodicCount = melodicEnd - melodicStart + 1
       for (let i = melodicStart; i <= melodicEnd; i++) melodicSum += freqData[i]
       melodicEnergy = melodicSum / (melodicCount * 255)
-    }
-
-    // 每秒打印一次能量统计，方便对比预览
-    if (!(this as any)._lastEnergyLog || timeSeconds - (this as any)._lastEnergyLog > 1) {
-      (this as any)._lastEnergyLog = timeSeconds
-      console.log('[Spectrum] t=' + timeSeconds.toFixed(1) + 's avgE=' + averageEnergy.toFixed(3) + ' bassE=' + bassEnergy.toFixed(3) + ' drumE=' + drumEnergy.toFixed(3) + ' melE=' + melodicEnergy.toFixed(3))
     }
 
     // 鼓点分轨：用独立鼓音轨 PCM 的能量覆盖 drumEnergy

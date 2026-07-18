@@ -26,7 +26,7 @@ jobs:
         run: |
           VERSION=$(node -p "require('./package.json').version")
           echo "version=${VERSION}-alpha" >> $GITHUB_OUTPUT
-          echo "Extracted version: ${VERSION}-alpha"
+          echo "Extracted version: ${VERSION}-alpha.2"
 
   build:
     needs: extract-version

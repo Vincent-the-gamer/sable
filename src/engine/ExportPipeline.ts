@@ -164,58 +164,49 @@ async function startExportFlow(
   if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
   console.log('[Export] ffmpeg pipe started, rendering frames...')
 
-  const CHUNK = Math.max(1, Math.floor(40_000_000 / frameSize))
-  const totalBufSize = CHUNK * frameSize
-  let chunkBuf = new Uint8Array(totalBufSize)
-  let cnt = 0
+  // Batch-render frames and push them into the shared Rust buffer.
+  // Batch size = 2 to keep IPC payload small (~16MB at 1080p) while still
+  // amortizing the round-trip overhead.
+  const BATCH = 2
   const t0 = performance.now()
   let totalBytesSent = 0
   let lastYield = t0
 
-  for (let i = 0; i < totalFrames; i++) {
+  for (let i = 0; i < totalFrames; i += BATCH) {
     if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
 
-    const pixels = renderer.renderFrame(i * frameDuration, frameDuration)
-    chunkBuf.set(pixels, cnt * frameSize)
-    cnt++
+    const batchT0 = performance.now()
 
-    if (cnt >= CHUNK || i === totalFrames - 1) {
-      const chunkBytes = chunkBuf.subarray(0, cnt * frameSize)
+    // Render a batch of frames
+    const batchCount = Math.min(BATCH, totalFrames - i)
+    const batch = new Uint8Array(batchCount * frameSize)
+    for (let j = 0; j < batchCount; j++) {
+      const renderT0 = performance.now()
+      const pixels = renderer.renderFrame((i + j) * frameDuration, frameDuration)
+      const renderMs = performance.now() - renderT0
+      batch.set(pixels, j * frameSize)
+      totalBytesSent += pixels.byteLength
+      if (j === 0) console.log(`[Export:js] render frame ${i + j} ${renderMs.toFixed(1)}ms`)
+    }
 
-      // 批量 RGBA → BGRA：在 contiguous buffer 上一次完成
-      // VideoToolbox 原生支持 BGRA，消除软件色彩空间转换
-      for (let p = 0; p < chunkBytes.length; p += 4) {
-        const r = chunkBytes[p]
-        chunkBytes[p] = chunkBytes[p + 2]
-        chunkBytes[p + 2] = r
-      }
+    const ipcT0 = performance.now()
+    await invoke('push_frames', {
+      data: batch.buffer.slice(batch.byteOffset, batch.byteOffset + batch.byteLength),
+      frameCount: batchCount,
+      totalFrames,
+    })
+    const ipcMs = performance.now() - ipcT0
+    const batchMs = performance.now() - batchT0
+    console.log(`[Export:js] batch ${i}+${batchCount} render ${batchMs.toFixed(1)}ms ipc ${ipcMs.toFixed(1)}ms`)
 
-      totalBytesSent += chunkBytes.byteLength
+    const pct = Math.round(((i + batchCount) / totalFrames) * 100)
+    onProgress?.({ currentFrame: i + batchCount, totalFrames, percent: pct, stage: 'rendering' })
 
-      // 使用 raw IPC 直接传输原始字节，完全绕过 base64 编码
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await (invoke as any)('send_raw_chunk',
-        chunkBytes.buffer.slice(
-          chunkBytes.byteOffset,
-          chunkBytes.byteOffset + chunkBytes.byteLength,
-        ),
-        {
-          headers: {
-            'X-Total-Frames': String(totalFrames),
-          },
-        },
-      )
-      cnt = 0
-
-      const pct = Math.round(((i + 1) / totalFrames) * 100)
-      onProgress?.({ currentFrame: i + 1, totalFrames, percent: pct, stage: 'rendering' })
-
-      // 按时间 yield（每 80ms），减少 event loop 让出开销
-      const now = performance.now()
-      if (now - lastYield > 80) {
-        await new Promise((r) => setTimeout(r, 0))
-        lastYield = now
-      }
+    // Yield every 50ms to keep UI responsive
+    const now = performance.now()
+    if (now - lastYield > 50) {
+      await new Promise((r) => setTimeout(r, 0))
+      lastYield = now
     }
   }
 

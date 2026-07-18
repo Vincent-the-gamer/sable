@@ -8,6 +8,11 @@ export class FftAnalyzer {
   private readonly sinTable: Float64Array
   private readonly cosTable: Float64Array
 
+  // 预分配工作缓冲区，避免每帧 GC
+  private readonly real: Float64Array
+  private readonly imag: Float64Array
+  private readonly magnitudes: Float32Array
+
   constructor(fftSize: number = 256) {
     this.fftSize = fftSize
     this.halfSize = fftSize / 2
@@ -20,6 +25,11 @@ export class FftAnalyzer {
       this.sinTable[i] = Math.sin(angle)
       this.cosTable[i] = Math.cos(angle)
     }
+
+    // 预分配 FFT 工作缓冲区
+    this.real = new Float64Array(this.fftSize)
+    this.imag = new Float64Array(this.fftSize)
+    this.magnitudes = new Float32Array(this.halfSize)
   }
 
   /**
@@ -33,8 +43,12 @@ export class FftAnalyzer {
     offset: number,
     windowSize: number = this.fftSize,
   ): Float32Array {
-    const real = new Float64Array(this.fftSize)
-    const imag = new Float64Array(this.fftSize)
+    const real = this.real
+    const imag = this.imag
+
+    // 清零
+    real.fill(0)
+    imag.fill(0)
 
     // 复制数据 + 应用 Hann 窗
     for (let i = 0; i < windowSize && offset + i < samples.length; i++) {
@@ -67,8 +81,8 @@ export class FftAnalyzer {
       }
     }
 
-    // 计算幅度并归一化
-    const magnitudes = new Float32Array(this.halfSize)
+    // 计算幅度并归一化（复用 magnitudes 缓冲区）
+    const magnitudes = this.magnitudes
     for (let i = 0; i < this.halfSize; i++) {
       magnitudes[i] = Math.sqrt(real[i] ** 2 + imag[i] ** 2) / this.fftSize
     }

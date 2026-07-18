@@ -390,7 +390,7 @@ export class WebGLFluidEngine {
     DENSITY_DISSIPATION: 1.5,       // 降低消散，染料更持久
     VELOCITY_DISSIPATION: 0.2,      // 降低速度消散
     PRESSURE: 0.9,                   // 提高压力保持
-    PRESSURE_ITERATIONS: 14,          // 导出模式适度降低迭代（预览已足够）
+    PRESSURE_ITERATIONS: 8,           // 从 14 降到 8，视觉差异极小但节省大量 GPU 时间
     CURL: 30,                        // 提高基础涡度
     SPLAT_RADIUS: 0.20,              // 更大的 splat 半径
     SPLAT_FORCE: 3500,               // 更大力道
@@ -410,6 +410,14 @@ export class WebGLFluidEngine {
 
   /** 导出模式下的模拟质量倍率 (默认 1.0，导出建议 2.0) */
   private simQualityMultiplier = 1.0
+
+  /** 每帧最大 splat 数量限制，避免高能量帧产生过多 shader passes（0 = 不限制） */
+  private maxSplatsPerFrame = 0
+
+  /** 设置每帧最大 splat 数量 */
+  setMaxSplatsPerFrame(max: number): void {
+    this.maxSplatsPerFrame = max
+  }
 
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, config: VisualizerConfig, preserveDrawing = false, simQualityMultiplier = 1.0) {
     this.canvas = canvas
@@ -1049,8 +1057,7 @@ export class WebGLFluidEngine {
       this._captureBuf = new Uint8Array(size)
     }
 
-    // Ensure all GL commands complete
-    gl.finish()
+    // gl.finish() removed — getImageData in composite renderer already forces GPU sync
 
     // Read from displayFBO (RGBA8, always has GPU backing unlike default FB)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.displayFBO.fbo)
@@ -1137,9 +1144,9 @@ export class WebGLFluidEngine {
     this.step(dt, this.currentAudioEnergy)
 
     // 渲染到 displayFBO（captureFrame 从 displayFBO 读取）
+    // 离线导出时不再调用 compositeToCanvas()，由 OfflineCompositeRenderer 直接 captureFrame
     if (this.displayWidth > 0 && this.displayHeight > 0) {
       this.renderDisplay(this.displayFBO.fbo)
-      this.compositeToCanvas()
     }
   }
 

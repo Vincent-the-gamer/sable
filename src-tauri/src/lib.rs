@@ -1,5 +1,6 @@
 mod audio;
 mod export;
+mod frame_buffer;
 
 use audio::decode_audio_file;
 use serde::Serialize;
@@ -94,42 +95,11 @@ fn start_piped_export(
     )
 }
 
+/// Push a batch of rendered frames into the shared buffer.
+/// Frame data is copied into Rust heap — no IPC serialization after this point.
 #[tauri::command]
-fn send_piped_chunk(
-    app: tauri::AppHandle,
-    data_base64: String,
-    total_frames: u32,
-) -> Result<(), String> {
-    export::send_piped_chunk(&app, &data_base64, total_frames)
-}
-
-/// Raw IPC: 直接传输二进制 RGBA 数据，无 base64 开销
-#[tauri::command]
-async fn send_raw_chunk(
-    app: tauri::AppHandle,
-    request: tauri::ipc::Request<'_>,
-) -> Result<(), String> {
-    let total_frames: u32 = request
-        .headers()
-        .get("x-total-frames")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let body: Vec<u8> = match request.body() {
-        tauri::ipc::InvokeBody::Raw(data) => data.clone(),
-        _ => return Err("Expected raw binary body".into()),
-    };
-    export::send_raw_chunk(&app, &body, total_frames)
-}
-
-#[tauri::command]
-fn send_piped_chunk_file(
-    app: tauri::AppHandle,
-    path: String,
-    total_frames: u32,
-) -> Result<(), String> {
-    export::send_piped_chunk_file(&app, &path, total_frames)
+fn push_frames(data: Vec<u8>, frame_count: u32, total_frames: u32) -> Result<u32, String> {
+    export::push_frames(data, frame_count, total_frames)
 }
 
 #[tauri::command]
@@ -183,9 +153,7 @@ pub fn run() {
             list_system_fonts,
             decode_audio_for_export,
             start_piped_export,
-            send_piped_chunk,
-            send_raw_chunk,
-            send_piped_chunk_file,
+            push_frames,
             finish_piped_export,
             cancel_video_export,
         ])
