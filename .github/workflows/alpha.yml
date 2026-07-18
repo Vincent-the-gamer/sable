@@ -116,19 +116,26 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            xdg-utils
 
       - name: Inject alpha version
         shell: bash
         run: |
           VERSION="${{ needs.extract-version.outputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
           node -e "
             const fs = require('fs');
             const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
             conf.version = '${VERSION}';
+            // MSI does not support pre-release identifiers like '-alpha'.
+            // On Windows, exclude MSI and only build NSIS installer for alpha releases.
+            if ('${PLATFORM}' === 'windows') {
+              conf.bundle.targets = ['nsis'];
+            }
             fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
           "
-          echo "✅ Injected version: ${VERSION}"
+          echo "✅ Injected version: ${VERSION} (platform: ${PLATFORM})"
 
       - name: Build Tauri app
         shell: bash
