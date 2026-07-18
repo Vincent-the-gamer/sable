@@ -4,6 +4,7 @@
   "description": "Audio Visualizer",
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@11.14.0",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
