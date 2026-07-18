@@ -64,10 +64,12 @@ pub fn start_piped_export(
         "32", // 最小分析大小，加速 rawvideo 管道输入
         "-analyzeduration",
         "0", // 跳过流分析
+        "-thread_queue_size",
+        "1024", // 增大输入管道缓冲，避免写端等待
         "-s",
         &format!("{width}x{height}"),
         "-pix_fmt",
-        "rgba",
+        "bgra", // 输出 BGRA，VideoToolbox 原生支持，跳过软件 CSC
         "-r",
         &fps.to_string(),
         "-i",
@@ -76,8 +78,9 @@ pub fn start_piped_export(
         audio_path,
     ]);
 
-    // 高质量色度缩放（对流体渐变内容非常重要）
-    cmd.args(["-sws_flags", "lanczos+accurate_rnd+full_chroma_int"]);
+    // 色度缩放：使用 fast_bilinear（对 NV12 子采样后的渐变内容视觉差异极小，
+    // 但比 lanczos 快 20x 以上，是管道导出最大的性能热点）
+    cmd.args(["-sws_flags", "fast_bilinear"]);
 
     // ═══ 通用参数：码率计算 + 色度缩放（对所有硬件编码器生效） ═══
     let bpp_quality = 0.45;
@@ -98,30 +101,19 @@ pub fn start_piped_export(
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(500_000);
             let bitrate_str = bitrate.to_string();
+            // VideoToolbox 原生接受 BGRA 像素，无需软件 -vf format=nv12
             let mut args = vec![
-                "-vf",
-                "format=nv12",
                 "-c:v",
                 "h264_videotoolbox",
                 "-b:v",
                 &bitrate_str,
                 "-allow_sw",
                 "1",
-                "-pix_fmt:v",
-                "yuv420p",
             ];
             if speed_preset == "superfast" || speed_preset == "ultrafast" {
                 args.extend_from_slice(&["-realtime", "1"]);
             }
-            args.extend_from_slice(&[
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-            ]);
+            args.extend_from_slice(&["-c:a", "aac", "-b:a", "192k", "-shortest"]);
             cmd.args(&args);
         }
         "videotoolbox_hevc" => {
@@ -134,9 +126,8 @@ pub fn start_piped_export(
             };
             let bitrate = ((width as f64 * height as f64 * fps as f64 * bpp) as u64).max(300_000);
             let bitrate_str = bitrate.to_string();
+            // VideoToolbox 原生接受 BGRA 像素，无需软件 -vf format=nv12
             let mut args = vec![
-                "-vf",
-                "format=nv12",
                 "-c:v",
                 "hevc_videotoolbox",
                 "-b:v",
@@ -145,21 +136,11 @@ pub fn start_piped_export(
                 "1",
                 "-tag:v",
                 "hvc1",
-                "-pix_fmt:v",
-                "yuv420p",
             ];
             if speed_preset == "superfast" || speed_preset == "ultrafast" {
                 args.extend_from_slice(&["-realtime", "1"]);
             }
-            args.extend_from_slice(&[
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-            ]);
+            args.extend_from_slice(&["-c:a", "aac", "-b:a", "192k", "-shortest"]);
             cmd.args(&args);
         }
 
@@ -197,8 +178,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
         "nvenc_hevc" => {
@@ -236,8 +215,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
 
@@ -274,8 +251,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
         "amf_hevc" => {
@@ -312,8 +287,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
 
@@ -342,8 +315,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
         "qsv_hevc" => {
@@ -372,8 +343,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
 
@@ -402,8 +371,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
         "vaapi_hevc" => {
@@ -432,8 +399,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
         }
         "software_vp9" => {
@@ -490,8 +455,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
             if preset == "ultrafast" {
                 cmd.args([
@@ -525,8 +488,6 @@ pub fn start_piped_export(
                 "-b:a",
                 "192k",
                 "-shortest",
-                "-movflags",
-                "+faststart",
             ]);
             if preset == "ultrafast" {
                 cmd.args([
@@ -608,6 +569,33 @@ pub fn send_piped_chunk(
     export
         .stdin
         .write_all(&bytes)
+        .map_err(|e| format!("Pipe write failed: {e}"))?;
+
+    let _ = app.emit(
+        "export-progress",
+        serde_json::json!({
+            "current_frame": 0u32,
+            "total_frames": total_frames,
+            "percent": 0u32,
+            "stage": "rendering"
+        }),
+    );
+
+    Ok(())
+}
+
+/// Send raw RGBA bytes directly to ffmpeg stdin (called via raw IPC, no base64 overhead)
+pub fn send_raw_chunk(app: &AppHandle, data: &[u8], total_frames: u32) -> Result<(), String> {
+    let mut guard = PIPED_EXPORT.lock().unwrap();
+    let export = guard.as_mut().ok_or("Pipe not started")?;
+
+    if is_cancelled() {
+        return Err("Cancelled".into());
+    }
+
+    export
+        .stdin
+        .write_all(data)
         .map_err(|e| format!("Pipe write failed: {e}"))?;
 
     let _ = app.emit(

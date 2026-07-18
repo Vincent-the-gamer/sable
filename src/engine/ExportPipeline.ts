@@ -164,12 +164,13 @@ async function startExportFlow(
   if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
   console.log('[Export] ffmpeg pipe started, rendering frames...')
 
-  const CHUNK = Math.max(1, Math.floor(20_000_000 / frameSize))
+  const CHUNK = Math.max(1, Math.floor(40_000_000 / frameSize))
   const totalBufSize = CHUNK * frameSize
   let chunkBuf = new Uint8Array(totalBufSize)
   let cnt = 0
   const t0 = performance.now()
   let totalBytesSent = 0
+  let lastYield = t0
 
   for (let i = 0; i < totalFrames; i++) {
     if (isCancelled?.()) { renderer.destroy(); throw new Error('Cancelled') }
@@ -180,20 +181,41 @@ async function startExportFlow(
 
     if (cnt >= CHUNK || i === totalFrames - 1) {
       const chunkBytes = chunkBuf.subarray(0, cnt * frameSize)
-      const b64 = _b64enc(chunkBytes)
+
+      // 批量 RGBA → BGRA：在 contiguous buffer 上一次完成
+      // VideoToolbox 原生支持 BGRA，消除软件色彩空间转换
+      for (let p = 0; p < chunkBytes.length; p += 4) {
+        const r = chunkBytes[p]
+        chunkBytes[p] = chunkBytes[p + 2]
+        chunkBytes[p + 2] = r
+      }
+
       totalBytesSent += chunkBytes.byteLength
 
-      await invoke('send_piped_chunk', {
-        dataBase64: b64,
-        totalFrames,
-      })
+      // 使用 raw IPC 直接传输原始字节，完全绕过 base64 编码
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (invoke as any)('send_raw_chunk',
+        chunkBytes.buffer.slice(
+          chunkBytes.byteOffset,
+          chunkBytes.byteOffset + chunkBytes.byteLength,
+        ),
+        {
+          headers: {
+            'X-Total-Frames': String(totalFrames),
+          },
+        },
+      )
       cnt = 0
 
       const pct = Math.round(((i + 1) / totalFrames) * 100)
       onProgress?.({ currentFrame: i + 1, totalFrames, percent: pct, stage: 'rendering' })
 
-      // Yield to keep UI responsive
-      await new Promise((r) => setTimeout(r, 0))
+      // 按时间 yield（每 80ms），减少 event loop 让出开销
+      const now = performance.now()
+      if (now - lastYield > 80) {
+        await new Promise((r) => setTimeout(r, 0))
+        lastYield = now
+      }
     }
   }
 
@@ -219,13 +241,4 @@ function _b64dec(b64: string): Uint8Array {
   const b = new Uint8Array(s.length)
   for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i)
   return b
-}
-
-function _b64enc(bytes: Uint8Array): string {
-  const K = 0x8000
-  const parts: string[] = []
-  for (let i = 0; i < bytes.length; i += K) {
-    parts.push(String.fromCharCode(...bytes.subarray(i, i + K)))
-  }
-  return btoa(parts.join(''))
 }

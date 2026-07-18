@@ -390,7 +390,7 @@ export class WebGLFluidEngine {
     DENSITY_DISSIPATION: 1.5,       // 降低消散，染料更持久
     VELOCITY_DISSIPATION: 0.2,      // 降低速度消散
     PRESSURE: 0.9,                   // 提高压力保持
-    PRESSURE_ITERATIONS: 20,
+    PRESSURE_ITERATIONS: 14,          // 导出模式适度降低迭代（预览已足够）
     CURL: 30,                        // 提高基础涡度
     SPLAT_RADIUS: 0.20,              // 更大的 splat 半径
     SPLAT_FORCE: 3500,               // 更大力道

@@ -103,6 +103,26 @@ fn send_piped_chunk(
     export::send_piped_chunk(&app, &data_base64, total_frames)
 }
 
+/// Raw IPC: 直接传输二进制 RGBA 数据，无 base64 开销
+#[tauri::command]
+async fn send_raw_chunk(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let total_frames: u32 = request
+        .headers()
+        .get("x-total-frames")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let body: Vec<u8> = match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => data.clone(),
+        _ => return Err("Expected raw binary body".into()),
+    };
+    export::send_raw_chunk(&app, &body, total_frames)
+}
+
 #[tauri::command]
 fn send_piped_chunk_file(
     app: tauri::AppHandle,
@@ -164,6 +184,7 @@ pub fn run() {
             decode_audio_for_export,
             start_piped_export,
             send_piped_chunk,
+            send_raw_chunk,
             send_piped_chunk_file,
             finish_piped_export,
             cancel_video_export,

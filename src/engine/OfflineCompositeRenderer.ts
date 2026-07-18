@@ -68,7 +68,7 @@ export class OfflineCompositeRenderer {
     this.fft = new FftAnalyzer(1024)
     this.beatDetector = new BeatDetector()
 
-    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 3.0)
+    this.fluidEngine = new WebGLFluidEngine(this.fluidCanvas, visualizerConfig, true, 1.5)
     this.fluidEngine.setDimensions(width, height)
 
     this.compositeCanvas = document.createElement('canvas')
