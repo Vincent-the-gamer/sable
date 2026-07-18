@@ -5,8 +5,8 @@
     <p><i>Primarily designed for launchpad performance videos.</i></p>
 </div>
 
-> [!WARNING]
-> This project is under construction.
+> [!NOTE]
+> This project is in alpha test stage.
 
 ## Installation
 
