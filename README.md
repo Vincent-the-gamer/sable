@@ -34,6 +34,10 @@ pnpm install
 pnpm tauri dev
 ```
 
+## Demo
+
+https://www.bilibili.com/video/BV1jaKw6DEew
+
 ## Preview
 
 ![1](./preview/1.png)
