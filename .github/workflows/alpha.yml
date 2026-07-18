@@ -1,0 +1,268 @@
+name: Alpha Build
+
+on:
+  push:
+    branches:
+      - alpha
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  extract-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Extract version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=${VERSION}-alpha" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}-alpha"
+
+  build:
+    needs: extract-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            arch: arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Setup Rust cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Inject alpha version
+        shell: bash
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          node -e "
+            const fs = require('fs');
+            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            conf.version = '${VERSION}';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
+          "
+          echo "✅ Injected version: ${VERSION}"
+
+      - name: Build Tauri app
+        shell: bash
+        run: pnpm tauri build --target ${{ matrix.target }}
+        env:
+          CI: true
+
+      - name: Collect and rename artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          PLATFORM="${{ matrix.platform }}"
+          ARCH="${{ matrix.arch }}"
+          PRODUCT="sable"
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          BIN_DIR="src-tauri/target/${{ matrix.target }}/release"
+
+          echo "Looking for bundles in: $BUNDLE_DIR"
+          if [ -d "$BUNDLE_DIR" ]; then
+            ls -laR "$BUNDLE_DIR"
+          fi
+
+          copy_rename() {
+            local src="$1"
+            local ext="$2"
+            local basename="${PRODUCT}_${VERSION}_${PLATFORM}_${ARCH}.${ext}"
+            cp "$src" "release/$basename"
+            echo "  -> $basename"
+          }
+
+          # Windows bundles
+          if [ -d "$BUNDLE_DIR/msi" ]; then
+            for f in "$BUNDLE_DIR/msi"/*.msi; do
+              [ -f "$f" ] && copy_rename "$f" "msi"
+            done
+          fi
+          if [ -d "$BUNDLE_DIR/nsis" ]; then
+            for f in "$BUNDLE_DIR/nsis"/*.exe; do
+              [ -f "$f" ] && copy_rename "$f" "exe"
+            done
+          fi
+
+          # macOS bundles
+          if [ -d "$BUNDLE_DIR/macos" ]; then
+            for f in "$BUNDLE_DIR/macos"/*.dmg; do
+              [ -f "$f" ] && copy_rename "$f" "dmg"
+            done
+          fi
+          if [ -d "$BUNDLE_DIR/dmg" ]; then
+            for f in "$BUNDLE_DIR/dmg"/*.dmg; do
+              [ -f "$f" ] && copy_rename "$f" "dmg"
+            done
+          fi
+
+          # Linux bundles
+          if [ -d "$BUNDLE_DIR/deb" ]; then
+            for f in "$BUNDLE_DIR/deb"/*.deb; do
+              [ -f "$f" ] && copy_rename "$f" "deb"
+            done
+          fi
+          if [ -d "$BUNDLE_DIR/rpm" ]; then
+            for f in "$BUNDLE_DIR/rpm"/*.rpm; do
+              [ -f "$f" ] && copy_rename "$f" "rpm"
+            done
+          fi
+          if [ -d "$BUNDLE_DIR/appimage" ]; then
+            for f in "$BUNDLE_DIR/appimage"/*.AppImage; do
+              [ -f "$f" ] && copy_rename "$f" "AppImage"
+            done
+          fi
+
+          # Fallback: grab the raw binary if no bundles found
+          if [ -z "$(ls -A release 2>/dev/null)" ]; then
+            echo "⚠ No bundles found, falling back to binary..."
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              [ -f "$BIN_DIR/sable.exe" ] && copy_rename "$BIN_DIR/sable.exe" "exe"
+            else
+              [ -f "$BIN_DIR/sable" ] && copy_rename "$BIN_DIR/sable" ""
+            fi
+          fi
+
+          echo ""
+          echo "=== Release artifacts ==="
+          ls -lh release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sable-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    needs: [extract-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Alpha Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="v${{ needs.extract-version.outputs.version }}"
+
+          # Delete existing release & tag if any
+          gh release delete "$VERSION" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$VERSION" 2>/dev/null || true
+          sleep 2
+
+          # Create pre-release
+          gh release create "$VERSION" \
+            --title "Alpha $VERSION" \
+            --notes "🚧 自动构建的 Alpha 内测版本 $VERSION
+
+          | 平台 | 架构 |
+          |------|------|
+          | Windows | x64, arm64 |
+          | Linux | x64, arm64 |
+          | macOS | x64, arm64 |" \
+            --prerelease \
+            --target "${{ github.sha }}"
+
+          # Upload all assets
+          find artifacts -type f | while read -r file; do
+            echo "Uploading: $file"
+            gh release upload "$VERSION" "$file" --clobber
+          done
+
+          echo "✅ Alpha release $VERSION created!"

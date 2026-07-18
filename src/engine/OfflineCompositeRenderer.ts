@@ -592,9 +592,18 @@ export class OfflineCompositeRenderer {
 
     // 随机位置（仅在入场时）
     if (entranceProgress <= 0.01) {
-      const margin = 0.1
-      as.targetX = (margin + Math.random() * (1 - 2 * margin) * cfg.positionRandomness) * w
-      as.targetY = h * 0.65 + (Math.random() - 0.5) * h * 0.15 * cfg.positionRandomness
+      const maxWPx = (cfg.maxWidth / 100) * w
+      const halfW = maxWPx / 2
+      const marginX = Math.min(8, halfW * 0.2)
+      const minX = halfW + marginX
+      const maxX = w - halfW - marginX
+      const marginY = h * 0.1
+      const minY = marginY
+      const maxY = h - marginY
+
+      const r = cfg.positionRandomness
+      as.targetX = minX + Math.random() * (maxX - minX) * r + (1 - r) * w / 2
+      as.targetY = minY + Math.random() * (maxY - minY) * r + (1 - r) * (h * 0.65)
       as.scale = 1
       as.beatScaleTarget = 1
     }
@@ -622,9 +631,16 @@ export class OfflineCompositeRenderer {
     as.swayX = Math.sin(t * 1.3 + 0.5) * cfg.swayAmount
     as.swayY = Math.cos(t * 0.9 + 1.2) * cfg.swayAmount * 0.6
 
-    // 位置平滑
+    // 位置平滑 + 裁剪，防止字幕超出画布
     as.posX += (as.targetX - as.posX) * 0.3
     as.posY += (as.targetY - as.posY) * 0.3
+    {
+      const maxWPx = (cfg.maxWidth / 100) * w
+      const halfW = maxWPx / 2
+      const marginX = Math.min(8, halfW * 0.2)
+      as.posX = Math.max(halfW + marginX, Math.min(w - halfW - marginX, as.posX))
+      as.posY = Math.max(h * 0.08, Math.min(h * 0.92, as.posY))
+    }
 
     // 入场/出场滑动偏移（在 Canvas 上直接应用，而非 CSS transform）
     let slideOffsetX = 0
@@ -691,21 +707,21 @@ export class OfflineCompositeRenderer {
       // 跟随流体色相动态调整 outerColor（与预览默认行为一致）
       const dynamicOuterColor = `hsl(${this.fluidEngine.config.hue}, 100%, 60%)`
 
-      // 最外层：大模糊 + 低透明度，模拟 CSS 最外层辉光
+      // 最外层：紧凑辉光，模拟 CSS 最外层
       ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha * 0.3)
-      ctx.shadowBlur = baseGlow * 1.5
+      ctx.shadowBlur = baseGlow * 0.8
       ctx.fillStyle = withAlpha(dynamicOuterColor, totalAlpha * 0.15)
       ctx.fillText(currentLyric.text, 0, 0, maxWidth)
 
       // 中层：中等模糊
       ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha * 0.5)
-      ctx.shadowBlur = baseGlow * 0.7
+      ctx.shadowBlur = baseGlow * 0.35
       ctx.fillStyle = withAlpha(dynamicOuterColor, totalAlpha * 0.25)
       ctx.fillText(currentLyric.text, 0, 0, maxWidth)
 
       // 内层：紧凑辉光，接近文字本体
       ctx.shadowColor = withAlpha(dynamicOuterColor, totalAlpha)
-      ctx.shadowBlur = baseGlow * 0.3
+      ctx.shadowBlur = baseGlow * 0.12
     }
 
     // 主文字层
@@ -736,7 +752,7 @@ export class OfflineCompositeRenderer {
     // 第 1 层：外层柔光（lighter 合成，模拟 CSS boxShadow 的外扩散层）
     ctx.save()
     ctx.globalCompositeOperation = 'lighter'
-    const outerWidth = glowWidth * 2.5
+    const outerWidth = glowWidth * 2.0
     const outerEdges = [
       { x: 0, y: 0, ew: w, eh: outerWidth },
       { x: 0, y: h - outerWidth, ew: w, eh: outerWidth },
@@ -748,16 +764,16 @@ export class OfflineCompositeRenderer {
       const grad = isVert
         ? ctx.createLinearGradient(edge.x === 0 ? 0 : w, 0, edge.x === 0 ? outerWidth : w - outerWidth, 0)
         : ctx.createLinearGradient(0, edge.y === 0 ? 0 : h, 0, edge.y === 0 ? outerWidth : h - outerWidth)
-      grad.addColorStop(0, `hsla(${hue}, 100%, 60%, ${alpha * 0.35})`)
-      grad.addColorStop(0.3, `hsla(${hue}, 100%, 50%, ${alpha * 0.15})`)
-      grad.addColorStop(0.7, `hsla(${hue}, 80%, 45%, ${alpha * 0.04})`)
+      grad.addColorStop(0, `hsla(${hue}, 100%, 65%, ${alpha * 0.4})`)
+      grad.addColorStop(0.15, `hsla(${hue}, 100%, 55%, ${alpha * 0.2})`)
+      grad.addColorStop(0.4, `hsla(${hue}, 90%, 48%, ${alpha * 0.06})`)
       grad.addColorStop(1, 'transparent')
       ctx.fillStyle = grad
       ctx.fillRect(edge.x, edge.y, edge.ew, edge.eh)
     }
     ctx.restore()
 
-    // 第 2 层：内层核心辉光（原实现，正常合成）
+    // 第 2 层：内层核心辉光 —— 收紧渐变，让边缘更锐利
     ctx.save()
     const edges = [
       { x: 0, y: 0, ew: w, eh: glowWidth },
@@ -770,10 +786,10 @@ export class OfflineCompositeRenderer {
       const grad = isVert
         ? ctx.createLinearGradient(edge.x === 0 ? 0 : w, 0, edge.x === 0 ? glowWidth : w - glowWidth, 0)
         : ctx.createLinearGradient(0, edge.y === 0 ? 0 : h, 0, edge.y === 0 ? glowWidth : h - glowWidth)
-      grad.addColorStop(0, `hsla(${hue}, 100%, 80%, ${alpha})`)
-      grad.addColorStop(0.15, `hsla(${hue}, 100%, 65%, ${alpha * 0.85})`)
-      grad.addColorStop(0.4, `hsla(${hue}, 90%, 50%, ${alpha * 0.5})`)
-      grad.addColorStop(0.7, `hsla(${hue}, 80%, 40%, ${alpha * 0.15})`)
+      grad.addColorStop(0, `hsla(${hue}, 100%, 90%, ${alpha})`)
+      grad.addColorStop(0.08, `hsla(${hue}, 100%, 70%, ${alpha * 0.9})`)
+      grad.addColorStop(0.25, `hsla(${hue}, 95%, 55%, ${alpha * 0.55})`)
+      grad.addColorStop(0.5, `hsla(${hue}, 85%, 42%, ${alpha * 0.2})`)
       grad.addColorStop(1, 'transparent')
       ctx.fillStyle = grad
       ctx.fillRect(edge.x, edge.y, edge.ew, edge.eh)

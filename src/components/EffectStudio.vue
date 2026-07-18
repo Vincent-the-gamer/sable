@@ -410,11 +410,20 @@ function hasEffect(effects: string[], name: string): boolean {
 
 function randomizePosition() {
     const r = props.subtitleConfig.positionRandomness;
-    const margin = 15;
-    animState.targetX =
-        margin + Math.random() * (100 - margin * 2) * r + (1 - r) * 50;
-    animState.targetY =
-        margin + Math.random() * (100 - margin * 2) * r + (1 - r) * 50;
+    const maxW = props.subtitleConfig.maxWidth;
+    const halfW = maxW / 2;
+    // 根据 maxWidth 计算水平安全范围，确保字幕不会超出容器
+    const marginX = Math.min(8, halfW * 0.2);
+    const minX = halfW + marginX;
+    const maxX = 100 - halfW - marginX;
+    const marginY = 10;
+    const minY = marginY;
+    const maxY = 100 - marginY;
+
+    const safeMinX = Math.max(marginX, minX - (1 - r) * (50 - marginX));
+    const safeMaxX = Math.min(100 - marginX, maxX + (1 - r) * (maxX - 50));
+    animState.targetX = safeMinX + Math.random() * (safeMaxX - safeMinX);
+    animState.targetY = minY + Math.random() * (maxY - minY);
 }
 
 function tickAnimation() {
@@ -441,6 +450,16 @@ function tickAnimation() {
     const ds = props.subtitleConfig.driftSpeed * 0.05;
     animState.posX += (animState.targetX - animState.posX) * ds;
     animState.posY += (animState.targetY - animState.posY) * ds;
+    // 裁剪位置，防止字幕漂移到容器外
+    {
+        const maxW = props.subtitleConfig.maxWidth;
+        const halfW = maxW / 2;
+        const marginX = Math.min(8, halfW * 0.2);
+        const minX = halfW + marginX;
+        const maxX = 100 - halfW - marginX;
+        animState.posX = Math.max(minX, Math.min(maxX, animState.posX));
+        animState.posY = Math.max(10, Math.min(90, animState.posY));
+    }
     animState.shakeX *= 0.85;
     animState.shakeY *= 0.85;
     animState.scale += (1 - animState.scale) * 0.2;
@@ -530,7 +549,7 @@ const lyricOverlayStyle = computed(() => {
     let entranceTransform = "";
     if (ep < 1) {
         const ease = 1 - Math.pow(1 - ep, 3); // ease-out cubic
-        const offset = (1 - ease) * 60;
+        const offset = (1 - ease) * 60 * previewScale.value;
         if (hasEffect(cfg.entranceEffect, "slideUp"))
             entranceTransform = ` translateY(${offset}px)`;
         else if (hasEffect(cfg.entranceEffect, "slideDown"))
@@ -546,7 +565,7 @@ const lyricOverlayStyle = computed(() => {
     let exitTransform = "";
     if (xp > 0) {
         const ease = xp;
-        const offset = ease * 40;
+        const offset = ease * 40 * previewScale.value;
         if (hasEffect(cfg.exitEffect, "slideUp"))
             exitTransform = ` translateY(${-offset}px)`;
         else if (hasEffect(cfg.exitEffect, "slideDown"))
@@ -574,9 +593,9 @@ const lyricOverlayStyle = computed(() => {
 
     let filter = "none";
     if (ep < 1 && hasEffect(cfg.entranceEffect, "blur"))
-        filter = `blur(${(1 - ep) * 8}px)`;
+        filter = `blur(${Math.round((1 - ep) * 8 * previewScale.value)}px)`;
     if (xp > 0 && hasEffect(cfg.exitEffect, "blur"))
-        filter = `blur(${xp * 8}px)`;
+        filter = `blur(${Math.round(xp * 8 * previewScale.value)}px)`;
 
     return {
         position: "absolute" as const,
@@ -593,7 +612,7 @@ const lyricOverlayStyle = computed(() => {
 });
 
 const lyricTextStyle = computed(() => ({
-    fontSize: `${props.subtitleConfig.fontSize}px`,
+    fontSize: `${Math.round(props.subtitleConfig.fontSize * previewScale.value)}px`,
     fontWeight: props.subtitleConfig.fontWeight,
     fontFamily:
         props.subtitleConfig.fontFamily === "inherit"
@@ -602,8 +621,8 @@ const lyricTextStyle = computed(() => ({
     letterSpacing: `${props.subtitleConfig.letterSpacing}em`,
     color: props.subtitleConfig.innerColor,
     textShadow: [
-        `0 0 ${props.subtitleConfig.glowSize}px ${lyricOuterColor.value}`,
-        `0 0 ${props.subtitleConfig.glowSize * 1.5}px ${withAlpha(lyricOuterColor.value, props.subtitleConfig.glowIntensity * 0.6)}`,
+        `0 0 ${Math.round(props.subtitleConfig.glowSize * previewScale.value)}px ${lyricOuterColor.value}`,
+        `0 0 ${Math.round(props.subtitleConfig.glowSize * 1.5 * previewScale.value)}px ${withAlpha(lyricOuterColor.value, props.subtitleConfig.glowIntensity * 0.6)}`,
         `0 2px 4px rgba(0,0,0,0.6)`,
     ].join(", "),
     wordBreak: "break-word" as const,
@@ -689,11 +708,11 @@ function renderBeatEdgeGlow() {
                   edge.y === 0 ? glowWidth : h - glowWidth,
               );
 
-        // 多层颜色叠加
-        grad.addColorStop(0, `hsla(${hue}, 100%, 80%, ${alpha})`);
-        grad.addColorStop(0.15, `hsla(${hue}, 100%, 65%, ${alpha * 0.85})`);
-        grad.addColorStop(0.4, `hsla(${hue}, 90%, 50%, ${alpha * 0.5})`);
-        grad.addColorStop(0.7, `hsla(${hue}, 80%, 40%, ${alpha * 0.15})`);
+        // 收紧渐变，让边缘更锐利（与导出保持一致）
+        grad.addColorStop(0, `hsla(${hue}, 100%, 90%, ${alpha})`);
+        grad.addColorStop(0.08, `hsla(${hue}, 100%, 70%, ${alpha * 0.9})`);
+        grad.addColorStop(0.25, `hsla(${hue}, 95%, 55%, ${alpha * 0.55})`);
+        grad.addColorStop(0.5, `hsla(${hue}, 85%, 42%, ${alpha * 0.2})`);
         grad.addColorStop(1, "transparent");
 
         ctx.fillStyle = grad;
@@ -747,6 +766,12 @@ const previewHeight = ref(360);
 const previewAspect = computed(
     () => props.exportSettings.width / props.exportSettings.height,
 );
+
+/** 预览到导出的缩放比例，用于让预览中的字幕/特效等比例缩放，确保预览所见即导出所得 */
+const previewScale = computed(() => {
+    if (!props.exportSettings.width || !previewWidth.value) return 1;
+    return previewWidth.value / props.exportSettings.width;
+});
 
 // 节拍边框辉光样式 — 鼓点触发时视频边缘一圈强烈发光闪烁
 const beatBorderStyle = computed(() => {
