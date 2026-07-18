@@ -14,7 +14,7 @@ FFmpeg is required, download it at https://www.ffmpeg.org/ and config the path i
 
 If the path you input is not found, the app will read ffmpeg in system PATH.
 
-Pre-release is coming soon. 
+Download Pre-release from: [Releases](https://github.com/Vincent-the-gamer/sable/releases)
 
 ## Get the audio stems
 
